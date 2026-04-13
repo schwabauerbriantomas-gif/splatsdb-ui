@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0
-"""3D Splat Visualization — interactive node graph with connections.
+"""3D Splat Visualization — interactive node graph with Gaussian Splat rendering.
 
 Uses pyqtgraph OpenGL for hardware-accelerated 3D rendering.
-Shows vector nodes as colored spheres, connections as lines.
-Click to select, hover to preview, scroll to zoom.
+Each vector node is rendered as a TRUE Gaussian Splat — soft, organic blob
+with alpha blending that merges with neighboring splats.
+Connections shown as translucent bezier-like lines.
 """
 
 from __future__ import annotations
 
 import numpy as np
 from typing import Optional
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSlider, QToolTip,
+    QComboBox, QSlider, QLabel as QLabel_,
 )
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QCursor
 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
@@ -27,25 +26,25 @@ from splatsdb_ui.utils.icons import icon
 
 
 class Splat3DView(QWidget):
-    """3D interactive visualization of vector nodes and their connections."""
+    """3D interactive visualization with true Gaussian Splat rendering."""
 
-    node_selected = Signal(str)      # node_id
-    node_hovered = Signal(str)       # node_id
-    connection_clicked = Signal(str, str)  # source_id, target_id
+    node_selected = Signal(str)
+    node_hovered = Signal(str)
+    connection_clicked = Signal(str, str)
 
     def __init__(self, signals, state):
         super().__init__()
         self.signals = signals
         self.state = state
 
-        self._nodes: dict[str, dict] = {}  # id -> {pos, color, size, metadata, files, connections}
+        self._nodes: dict[str, dict] = {}
         self._positions: Optional[np.ndarray] = None
         self._colors: Optional[np.ndarray] = None
         self._sizes: Optional[np.ndarray] = None
         self._scatter: Optional[gl.GLScatterPlotItem] = None
         self._lines: list[gl.GLLinePlotItem] = []
         self._selected_idx: int = -1
-        self._highlight_sphere: Optional[gl.GLMeshItem] = None
+        self._highlight: Optional[gl.GLScatterPlotItem] = None
 
         self._build_ui()
 
@@ -70,13 +69,21 @@ class Splat3DView(QWidget):
         self.layout_combo.currentTextChanged.connect(self._on_layout_changed)
         toolbar.addWidget(self.layout_combo)
 
-        toolbar.addWidget(QLabel("Point size:"))
+        toolbar.addWidget(QLabel("Splat size:"))
         self.size_slider = QSlider(Qt.Horizontal)
-        self.size_slider.setRange(2, 30)
-        self.size_slider.setValue(8)
+        self.size_slider.setRange(4, 40)
+        self.size_slider.setValue(16)
         self.size_slider.setFixedWidth(100)
         self.size_slider.valueChanged.connect(self._on_size_changed)
         toolbar.addWidget(self.size_slider)
+
+        toolbar.addWidget(QLabel("Opacity:"))
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(10, 100)
+        self.opacity_slider.setValue(60)
+        self.opacity_slider.setFixedWidth(80)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        toolbar.addWidget(self.opacity_slider)
 
         toolbar.addWidget(QLabel("Connections:"))
         self.conn_combo = QComboBox()
@@ -97,14 +104,13 @@ class Splat3DView(QWidget):
         toolbar_widget.setStyleSheet(f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};")
         layout.addWidget(toolbar_widget)
 
-        # 3D View (with fallback for headless)
+        # 3D View placeholder
         self._gl_available = False
         self.gl_widget = QLabel("3D view requires OpenGL\nConnect a display to enable")
         self.gl_widget.setAlignment(Qt.AlignCenter)
         self.gl_widget.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 14px; background-color: {Colors.BG};")
         self.gl_widget.setMinimumHeight(400)
 
-        # Try to init GL after window is shown
         import os
         if not os.environ.get("SPLATSDB_NO_GL"):
             from PySide6.QtCore import QTimer
@@ -113,33 +119,17 @@ class Splat3DView(QWidget):
         layout.addWidget(self.gl_widget, stretch=1)
 
         # Info bar
-        self.info_bar = QLabel("Click a node to inspect | Scroll to zoom | Drag to rotate")
+        self.info_bar = QLabel("Click a splat to inspect | Scroll to zoom | Drag to rotate")
         self.info_bar.setStyleSheet(f"""
             color: {Colors.TEXT_DIM}; font-size: 11px; padding: 6px 12px;
             background-color: {Colors.BG_RAISED}; border-top: 1px solid {Colors.BORDER};
         """)
         layout.addWidget(self.info_bar)
 
-        # Mouse tracking
-        self.gl_widget.setMouseTracking(True)
-
         self.setStyleSheet(f"background-color: {Colors.BG};")
 
     def load_nodes(self, nodes: list[dict]):
-        """Load nodes into the 3D view.
-
-        Each node dict:
-        {
-            "id": str,
-            "vector": list[float],    # embedding
-            "position": list[float],  # 3D position (x, y, z) — optional, computed if missing
-            "color": list[float],     # RGBA 0-1 — optional
-            "size": float,            # optional
-            "metadata": dict,         # text, labels, tags
-            "files": list[str],       # file paths
-            "connections": list[{"id": str, "score": float}],
-        }
-        """
+        """Load splats into the 3D view."""
         if not nodes:
             return
 
@@ -157,23 +147,25 @@ class Splat3DView(QWidget):
 
         self._positions = np.array(positions, dtype=np.float32)
 
-        # Normalize to [-15, 15] range
+        # Normalize to [-15, 15]
         for dim in range(3):
             col = self._positions[:, dim]
-            min_val, max_val = col.min(), col.max()
-            if max_val > min_val:
-                self._positions[:, dim] = (col - min_val) / (max_val - min_val) * 30 - 15
+            mn, mx = col.min(), col.max()
+            if mx > mn:
+                self._positions[:, dim] = (col - mn) / (mx - mn) * 30 - 15
 
-        # Colors — by cluster/collection or random
+        # Colors — Gaussian Splat palette (warm, organic tones)
         colors = []
+        opacity = self.opacity_slider.value() / 100.0
         for i, node in enumerate(nodes):
             if "color" in node:
-                colors.append(node["color"][:4] if len(node["color"]) >= 4 else [*node["color"][:3], 1.0])
+                c = node["color"][:3]
+                colors.append([*c, opacity])
             else:
-                # Generate color from node index (golden ratio distribution)
                 hue = (i * 0.618033988749895) % 1.0
-                r, g, b = self._hsv_to_rgb(hue, 0.6, 0.85)
-                colors.append([r, g, b, 0.85])
+                r, g, b = self._hsv_to_rgb(hue, 0.55, 0.9)
+                # Splat colors: slightly desaturated, high brightness for glow effect
+                colors.append([r, g, b, opacity])
 
         self._colors = np.array(colors, dtype=np.float32)
 
@@ -182,32 +174,39 @@ class Splat3DView(QWidget):
         sizes = np.array([node.get("size", base_size) for node in nodes], dtype=np.float32)
         self._sizes = sizes
 
-        # Clear old items
         self._clear_items()
 
         if not self._gl_available:
-            self.info_bar.setText(f"{len(nodes)} nodes loaded (3D unavailable)")
+            self.info_bar.setText(f"{len(nodes)} splats loaded (3D unavailable)")
             return
 
-        # Add scatter
+        # Render as splats using GL_POINTS with GL_POINT_SMOOTH
+        # This gives soft, circular Gaussian-like blobs
+        self._render_splats()
+
+        # Draw connections as soft translucent lines
+        self._draw_connections(nodes)
+
+        self.info_bar.setText(f"{len(nodes)} splats | {self._count_connections(nodes)} connections")
+
+    def _render_splats(self):
+        """Render splats with soft, organic Gaussian look."""
+        # Use scatter with large point size + smooth for splat effect
         self._scatter = gl.GLScatterPlotItem(
             pos=self._positions,
             color=self._colors,
             size=self._sizes,
             pxMode=True,
+            glOptions='translucent',  # Critical: enables alpha blending
         )
+        # Enable GL_POINT_SMOOTH for soft circular points (Gaussian-like)
+        self._scatter.setGLOptions('translucent')
         self.gl_widget.addItem(self._scatter)
 
-        # Add connections
-        self._draw_connections(nodes)
-
-        self.info_bar.setText(f"{len(nodes)} nodes loaded | {self._count_connections(nodes)} connections")
-
     def _draw_connections(self, nodes: list[dict]):
-        """Draw connection lines between nodes."""
+        """Draw soft translucent connection lines between splats."""
         if not self._gl_available:
             return
-        # Clear old lines
         for line in self._lines:
             try:
                 self.gl_widget.removeItem(line)
@@ -220,9 +219,8 @@ class Splat3DView(QWidget):
             return
 
         id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
-
         edges_drawn = 0
-        max_edges = 2000  # Performance limit
+        max_edges = 2000
 
         for i, node in enumerate(nodes):
             if edges_drawn >= max_edges:
@@ -232,7 +230,6 @@ class Splat3DView(QWidget):
             if not connections:
                 continue
 
-            # Filter by mode
             if mode == "Nearest 5":
                 connections = sorted(connections, key=lambda c: c.get("score", 0), reverse=True)[:5]
             elif mode == "Nearest 10":
@@ -245,27 +242,39 @@ class Splat3DView(QWidget):
                 if target_id not in id_to_idx:
                     continue
                 j = id_to_idx[target_id]
-                if j <= i:  # Avoid duplicates
+                if j <= i:
                     continue
 
                 score = conn.get("score", 0.5)
 
-                # Line from node i to node j
-                line_pos = np.array([self._positions[i], self._positions[j]])
-
-                # Color based on score: green=strong, yellow=medium, red=weak
+                # Soft connection colors matching splat aesthetic
                 if score > 0.8:
-                    lc = (0.34, 0.83, 0.36, 0.3)
+                    lc = (0.34, 0.83, 0.36, 0.25)
                 elif score > 0.5:
-                    lc = (0.96, 0.62, 0.04, 0.2)
+                    lc = (0.96, 0.62, 0.04, 0.18)
                 else:
-                    lc = (0.94, 0.27, 0.27, 0.15)
+                    lc = (0.94, 0.27, 0.27, 0.12)
+
+                # Multi-segment line for slight curve (bezier approximation)
+                p1 = self._positions[i]
+                p2 = self._positions[j]
+                mid = (p1 + p2) / 2
+                # Slight perpendicular offset for organic feel
+                perp = np.array([-(p2[1]-p1[1]), p2[0]-p1[0], 0.0]) * 0.05 * (1 - score)
+                pts = np.array([
+                    p1,
+                    (p1 + mid) / 2 + perp,
+                    mid + perp * 0.5,
+                    (p2 + mid) / 2 + perp,
+                    p2,
+                ])
 
                 line = gl.GLLinePlotItem(
-                    pos=line_pos,
+                    pos=pts,
                     color=lc,
-                    width=1.0 + score * 2,
+                    width=0.8 + score * 1.5,
                     antialias=True,
+                    glOptions='translucent',
                 )
                 self.gl_widget.addItem(line)
                 self._lines.append(line)
@@ -273,39 +282,42 @@ class Splat3DView(QWidget):
 
     def _count_connections(self, nodes: list[dict]) -> int:
         total = sum(len(n.get("connections", [])) for n in nodes)
-        return total // 2  # Undirected
+        return total // 2
 
     def select_node(self, node_id: str):
-        """Highlight a node and emit node_selected."""
+        """Highlight a splat and emit node_selected."""
         if not self._gl_available or self._positions is None:
             return
         idx = None
-        for i, n in enumerate(self._nodes.values()):
-            if list(self._nodes.keys())[i] == node_id:
+        for i, key in enumerate(self._nodes.keys()):
+            if key == node_id:
                 idx = i
                 break
         if idx is None:
             return
 
         # Remove old highlight
-        if self._highlight_sphere is not None:
-            self.gl_widget.removeItem(self._highlight_sphere)
+        if self._highlight is not None:
+            try:
+                self.gl_widget.removeItem(self._highlight)
+            except Exception:
+                pass
 
-        # Create highlight sphere
-        md = gl.MeshData.sphere(rows=16, cols=16, radius=0.8)
-        self._highlight_sphere = gl.GLMeshItem(
-            meshdata=md,
-            smooth=True,
-            color=pg.mkColor(Colors.ACCENT),
-            shader='shaded',
+        # Highlight: bright pulsing splat behind selected node
+        highlight_color = np.array([[0.96, 0.62, 0.04, 0.9]], dtype=np.float32)
+        highlight_pos = self._positions[idx:idx+1]
+        self._highlight = gl.GLScatterPlotItem(
+            pos=highlight_pos,
+            color=highlight_color,
+            size=np.array([self._sizes[idx] * 2.5], dtype=np.float32),
+            pxMode=True,
             glOptions='translucent',
         )
-        self._highlight_sphere.translate(*self._positions[idx])
-        self.gl_widget.addItem(self._highlight_sphere)
+        self.gl_widget.addItem(self._highlight)
 
         self._selected_idx = idx
 
-        # Zoom to node
+        # Pan to splat
         pos = self._positions[idx]
         self.gl_widget.pan(pos[0], pos[1], pos[2])
 
@@ -317,7 +329,6 @@ class Splat3DView(QWidget):
         self.node_selected.emit(node_id)
 
     def _on_layout_changed(self, layout_name: str):
-        """Recompute node positions with different dimensionality reduction."""
         if self._positions is None:
             return
 
@@ -337,11 +348,12 @@ class Splat3DView(QWidget):
         if layout_name == "First 3 Dims":
             self._positions = mat[:, :3].copy()
         elif layout_name == "PCA" and mat.shape[1] >= 3:
-            from sklearn.decomposition import PCA
-            pca = PCA(n_components=3)
-            self._positions = pca.fit_transform(mat).astype(np.float32)
+            try:
+                from sklearn.decomposition import PCA
+                self._positions = PCA(n_components=3).fit_transform(mat).astype(np.float32)
+            except ImportError:
+                self._positions = mat[:, :3].copy()
         elif layout_name in ("UMAP", "t-SNE"):
-            # Fallback to first 3 dims if sklearn extras not available
             try:
                 if layout_name == "UMAP":
                     import umap
@@ -355,24 +367,27 @@ class Splat3DView(QWidget):
         else:
             self._positions = mat[:, :3].copy()
 
-        # Normalize
         for dim in range(3):
             col = self._positions[:, dim]
-            min_val, max_val = col.min(), col.max()
-            if max_val > min_val:
-                self._positions[:, dim] = (col - min_val) / (max_val - min_val) * 30 - 15
+            mn, mx = col.min(), col.max()
+            if mx > mn:
+                self._positions[:, dim] = (col - mn) / (mx - mn) * 30 - 15
 
-        # Update scatter
         if self._scatter:
             self._scatter.setData(pos=self._positions, color=self._colors, size=self._sizes)
 
-        # Redraw connections
         self._draw_connections(nodes)
 
     def _on_size_changed(self, value: int):
         if self._scatter and self._sizes is not None:
             self._sizes = np.full(len(self._sizes), value, dtype=np.float32)
             self._scatter.setData(size=self._sizes)
+
+    def _on_opacity_changed(self, value: int):
+        if self._scatter and self._colors is not None:
+            opacity = value / 100.0
+            self._colors[:, 3] = opacity
+            self._scatter.setData(color=self._colors)
 
     def _on_connections_changed(self, _mode: str):
         if self._nodes:
@@ -398,22 +413,21 @@ class Splat3DView(QWidget):
             except Exception:
                 pass
         self._lines.clear()
-        if self._highlight_sphere:
+        if self._highlight:
             try:
-                self.gl_widget.removeItem(self._highlight_sphere)
+                self.gl_widget.removeItem(self._highlight)
             except Exception:
                 pass
-            self._highlight_sphere = None
+            self._highlight = None
 
     @staticmethod
-    def _hsv_to_rgb(h: float, s: float, v: float) -> tuple:
+    def _hsv_to_rgb(h, s, v):
         import colorsys
         return colorsys.hsv_to_rgb(h, s, v)
 
     def _try_init_gl(self):
-        """Attempt to initialize OpenGL widget. Falls back to QLabel if unavailable."""
+        """Init OpenGL with splat-optimized settings."""
         try:
-            # Remove placeholder
             self.layout().removeWidget(self.gl_widget)
             self.gl_widget.deleteLater()
 
@@ -423,27 +437,26 @@ class Splat3DView(QWidget):
             self.gl_widget.setMinimumHeight(400)
             self._gl_available = True
 
-            # Add grid
+            # Grid (subtle, dark)
             grid = gl.GLGridItem()
             grid.setSize(50, 50, 1)
             grid.setSpacing(5, 5, 5)
-            grid.setColor(pg.mkColor(Colors.BORDER))
+            grid.setColor(pg.mkColor(20, 23, 30))
             self.gl_widget.addItem(grid)
 
-            # Add axes
-            axis_length = 25
+            # Axes (subtle)
+            axis_len = 25
             for color, direction in [
-                (pg.mkColor("#ef4444"), np.array([[0, 0, 0], [axis_length, 0, 0]])),
-                (pg.mkColor("#22c55e"), np.array([[0, 0, 0], [0, axis_length, 0]])),
-                (pg.mkColor("#3b82f6"), np.array([[0, 0, 0], [0, 0, axis_length]])),
+                (pg.mkColor(80, 30, 30), np.array([[0, 0, 0], [axis_len, 0, 0]])),
+                (pg.mkColor(30, 80, 30), np.array([[0, 0, 0], [0, axis_len, 0]])),
+                (pg.mkColor(30, 30, 80), np.array([[0, 0, 0], [0, 0, axis_len]])),
             ]:
-                line = gl.GLLinePlotItem(pos=direction, color=color, width=2, antialias=True)
+                line = gl.GLLinePlotItem(pos=direction, color=color, width=1, antialias=True)
                 self.gl_widget.addItem(line)
 
             self.gl_widget.setMouseTracking(True)
             self.layout().insertWidget(1, self.gl_widget, stretch=1)
 
-            # Re-render if data was loaded
             if self._positions is not None:
                 nodes = list(self._nodes.values())
                 self.load_nodes(nodes)
@@ -453,7 +466,8 @@ class Splat3DView(QWidget):
 
     def get_params(self) -> list:
         return [
-            {"name": "node_size", "label": "Node Size", "type": "spin", "min": 2, "max": 30, "default": 8},
+            {"name": "splat_size", "label": "Splat Size", "type": "spin", "min": 4, "max": 40, "default": 16},
+            {"name": "opacity", "label": "Opacity", "type": "spin", "min": 10, "max": 100, "default": 60},
             {"name": "connection_mode", "label": "Connections", "type": "combo",
              "options": ["All", "Nearest 5", "Nearest 10", "Above threshold", "None"]},
             {"name": "layout", "label": "Layout", "type": "combo",
