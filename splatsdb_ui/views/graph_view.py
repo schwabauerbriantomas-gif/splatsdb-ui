@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Graph view — knowledge graph visualization."""
+"""Graph view."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QLineEdit, QComboBox,
-    QHeaderView, QSplitter, QFrame,
+    QTreeWidget, QLineEdit, QComboBox, QHeaderView, QSplitter, QFrame,
 )
 from PySide6.QtCore import Qt
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import GRAPH, SEARCH, REFRESH
+from splatsdb_ui.utils.icons import icon
 
 
 class GraphView(QWidget):
@@ -29,56 +28,54 @@ class GraphView(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        refresh_btn = QPushButton(f"{REFRESH}")
+        refresh_btn = QPushButton()
+        refresh_btn.setIcon(icon("refresh", Colors.TEXT_DIM))
         refresh_btn.setFixedSize(32, 32)
         header.addWidget(refresh_btn)
         layout.addLayout(header)
 
-        # Entity search
         search_row = QHBoxLayout()
         self.entity_input = QLineEdit()
         self.entity_input.setPlaceholderText("Search entities...")
         search_row.addWidget(self.entity_input, stretch=1)
-        search_btn = QPushButton(f"{SEARCH}")
+        search_btn = QPushButton()
+        search_btn.setIcon(icon("search", Colors.TEXT))
         search_btn.setFixedSize(32, 32)
         search_row.addWidget(search_btn)
         layout.addLayout(search_row)
 
-        # Splitter: nodes | edges
         splitter = QSplitter(Qt.Horizontal)
 
-        # Nodes tree
-        nodes_frame = QFrame()
-        nodes_layout = QVBoxLayout(nodes_frame)
-        nodes_layout.setContentsMargins(0, 0, 0, 0)
-        nodes_layout.addWidget(QLabel("Nodes"))
+        nodes = QFrame()
+        nl = QVBoxLayout(nodes)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.addWidget(QLabel("Nodes"))
         self.nodes_tree = QTreeWidget()
         self.nodes_tree.setHeaderLabels(["Entity", "Type", "Connections"])
         self.nodes_tree.header().setStretchLastSection(True)
-        nodes_layout.addWidget(self.nodes_tree)
-        splitter.addWidget(nodes_frame)
+        nl.addWidget(self.nodes_tree)
+        splitter.addWidget(nodes)
 
-        # Edges tree
-        edges_frame = QFrame()
-        edges_layout = QVBoxLayout(edges_frame)
-        edges_layout.setContentsMargins(0, 0, 0, 0)
-        edges_layout.addWidget(QLabel("Edges"))
+        edges = QFrame()
+        el = QVBoxLayout(edges)
+        el.setContentsMargins(0, 0, 0, 0)
+        el.addWidget(QLabel("Edges"))
         self.edges_tree = QTreeWidget()
         self.edges_tree.setHeaderLabels(["Source", "Relation", "Target", "Weight"])
         self.edges_tree.header().setStretchLastSection(True)
-        edges_layout.addWidget(self.edges_tree)
-        splitter.addWidget(edges_frame)
+        el.addWidget(self.edges_tree)
+        splitter.addWidget(edges)
 
         splitter.setSizes([500, 500])
         layout.addWidget(splitter, stretch=1)
 
-        # Traversal controls
         traversal = QHBoxLayout()
         traversal.addWidget(QLabel("Max depth:"))
         self.depth_combo = QComboBox()
         self.depth_combo.addItems(["1", "2", "3", "4", "5"])
         traversal.addWidget(self.depth_combo)
         traverse_btn = QPushButton("Traverse")
+        traverse_btn.setIcon(icon("arrow-right", Colors.BG))
         traverse_btn.setProperty("class", "primary")
         traversal.addWidget(traverse_btn)
         traversal.addStretch()
@@ -88,5 +85,4 @@ class GraphView(QWidget):
         return [
             {"name": "max_neighbors", "label": "Max Neighbors", "type": "spin", "min": 1, "max": 256, "default": 50},
             {"name": "traverse_depth", "label": "Traverse Depth", "type": "spin", "min": 1, "max": 20, "default": 3},
-            {"name": "boost_weight", "label": "Boost Weight", "type": "float", "min": 0.0, "max": 1.0, "step": 0.01, "default": 0.5},
         ]

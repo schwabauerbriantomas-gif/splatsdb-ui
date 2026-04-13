@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Global search bar — minimal, professional."""
+"""Global search bar."""
 
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLineEdit, QPushButton, QLabel
 from PySide6.QtCore import Signal
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import SEARCH
+from splatsdb_ui.utils.icons import icon
 
 
 class GlobalSearchBar(QWidget):
@@ -20,7 +20,6 @@ class GlobalSearchBar(QWidget):
         layout.setContentsMargins(16, 6, 16, 6)
         layout.setSpacing(10)
 
-        # Brand mark
         brand = QLabel("SPLATSDB")
         brand.setStyleSheet(f"""
             color: {Colors.TEXT_DIM};
@@ -31,24 +30,19 @@ class GlobalSearchBar(QWidget):
         brand.setFixedWidth(80)
         layout.addWidget(brand)
 
-        # Search input
         self.input = QLineEdit()
         self.input.setPlaceholderText("Search vectors...  Ctrl+K")
         self.input.returnPressed.connect(self._on_search)
         layout.addWidget(self.input, stretch=1)
 
-        # Search button
-        self.btn = QPushButton(SEARCH)
+        self.btn = QPushButton()
+        self.btn.setIcon(icon("search", Colors.BG))
         self.btn.setFixedSize(34, 34)
         self.btn.clicked.connect(self._on_search)
         self.btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {Colors.ACCENT};
-                border: none;
+                background-color: {Colors.ACCENT}; border: none;
                 border-radius: 6px;
-                color: {Colors.BG};
-                font-size: 12px;
-                font-weight: bold;
             }}
             QPushButton:hover {{ background-color: {Colors.ACCENT_BRIGHT}; }}
         """)

@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Cluster view — distributed cluster dashboard."""
+"""Cluster view."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
     QFormLayout, QLineEdit,
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import CLUSTER, REFRESH, ADD, REMOVE
+from splatsdb_ui.utils.icons import icon
 
 
 class ClusterView(QWidget):
@@ -30,36 +28,35 @@ class ClusterView(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        refresh_btn = QPushButton(f"{REFRESH}")
+        refresh_btn = QPushButton()
+        refresh_btn.setIcon(icon("refresh", Colors.TEXT_DIM))
         refresh_btn.setFixedSize(32, 32)
         header.addWidget(refresh_btn)
-        add_btn = QPushButton(f"{ADD} Node")
+
+        add_btn = QPushButton("Add Node")
+        add_btn.setIcon(icon("plus", Colors.BG))
         add_btn.setProperty("class", "primary")
         header.addWidget(add_btn)
         layout.addLayout(header)
 
-        # Cluster info
-        info_group = QGroupBox("Cluster Status")
-        info_form = QFormLayout(info_group)
+        info = QGroupBox("Cluster Status")
+        form = QFormLayout(info)
         self.lbl_nodes = QLabel("0 nodes")
         self.lbl_shards = QLabel("0 shards")
         self.lbl_status = QLabel("Standby")
-        info_form.addRow("Nodes:", self.lbl_nodes)
-        info_form.addRow("Shards:", self.lbl_shards)
-        info_form.addRow("Status:", self.lbl_status)
-        layout.addWidget(info_group)
+        form.addRow("Nodes:", self.lbl_nodes)
+        form.addRow("Shards:", self.lbl_shards)
+        form.addRow("Status:", self.lbl_status)
+        layout.addWidget(info)
 
-        # Node table
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Node", "Address", "Status", "Vectors", "CPU", "Memory"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setAlternatingRowColors(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         layout.addWidget(self.table, stretch=1)
 
-        # Routing info
         routing = QHBoxLayout()
         routing.addWidget(QLabel("Sharding:"))
         self.shard_input = QLineEdit()
@@ -72,5 +69,4 @@ class ClusterView(QWidget):
         return [
             {"name": "min_nodes", "label": "Min Nodes", "type": "spin", "min": 1, "max": 100, "default": 1},
             {"name": "max_nodes", "label": "Max Nodes", "type": "spin", "min": 1, "max": 1000, "default": 50},
-            {"name": "n_chunks", "label": "MapReduce Chunks", "type": "spin", "min": 1, "max": 256, "default": 32},
         ]

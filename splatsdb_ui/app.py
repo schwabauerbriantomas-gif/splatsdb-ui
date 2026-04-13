@@ -18,8 +18,8 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut
 
 from splatsdb_ui.utils.signals import SignalBus
 from splatsdb_ui.utils.state import AppState
-from splatsdb_ui.utils.theme import load_theme
-from splatsdb_ui.utils.icons import tab_label
+from splatsdb_ui.utils.theme import load_theme, Colors
+from splatsdb_ui.utils.icons import tab_label, TAB_ICONS, icon as svg_icon
 
 from splatsdb_ui.engine_manager import EngineManager, EngineConfig, EngineStatus, PRESETS
 
@@ -110,12 +110,13 @@ class MainWindow(
         for view_id, view_cls in view_defs:
             view = view_cls(self.signals, self.state)
             self._views[view_id] = view
-            self.view_tabs.addTab(view, tab_label(view_id))
+            ico = svg_icon(TAB_ICONS.get(view_id, "home"), Colors.TEXT_DIM, 16)
+            idx = self.view_tabs.addTab(view, ico, tab_label(view_id))
 
         # Config tab (no signals/state)
         self.config_editor = ConfigEditor()
         self._views["config"] = self.config_editor
-        self.view_tabs.addTab(self.config_editor, tab_label("config"))
+        self.view_tabs.addTab(self.config_editor, svg_icon("config", Colors.TEXT_DIM, 16), tab_label("config"))
 
         self.view_tabs.currentChanged.connect(self._on_tab_changed)
         content_splitter.addWidget(self.view_tabs)

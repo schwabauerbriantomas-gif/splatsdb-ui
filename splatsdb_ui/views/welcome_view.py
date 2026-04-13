@@ -1,38 +1,36 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Welcome view — landing page with quick actions."""
+"""Welcome view."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QFrame, QGridLayout, QSizePolicy,
+    QComboBox, QFrame, QGridLayout,
 )
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QFont, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import SEARCH, COLLECTION, GRAPH, SPATIAL, OCR, FILE, LINK
+from splatsdb_ui.utils.icons import icon
 
 
-class _ActionCard(QFrame):
-    """Clickable card for a quick action."""
+class ActionCard(QFrame):
     clicked = Signal(str)
 
-    def __init__(self, action_id: str, title: str, description: str):
+    def __init__(self, action_id: str, title: str, description: str, icon_name: str):
         super().__init__()
         self.action_id = action_id
-        self._title = title
         self.setCursor(Qt.PointingHandCursor)
-        self._build_ui(title, description)
+        self._build_ui(title, description, icon_name)
 
-    def _build_ui(self, title: str, desc: str):
+    def _build_ui(self, title: str, desc: str, icon_name: str):
         self.setFixedSize(200, 100)
         self.setStyleSheet(f"""
-            _ActionCard {{
+            ActionCard {{
                 background-color: {Colors.BG_RAISED};
                 border: 1px solid {Colors.BORDER};
                 border-radius: 10px;
                 padding: 14px;
             }}
-            _ActionCard:hover {{
+            ActionCard:hover {{
                 border-color: {Colors.ACCENT};
                 background-color: {Colors.BG_OVERLAY};
             }}
@@ -41,9 +39,16 @@ class _ActionCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
 
+        header = QHBoxLayout()
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(icon(icon_name, Colors.ACCENT, 18).pixmap(18, 18))
+        header.addWidget(icon_lbl)
+
         t = QLabel(title)
-        t.setStyleSheet(f"color: {Colors.ACCENT}; font-weight: 700; font-size: 13px;")
-        layout.addWidget(t)
+        t.setStyleSheet(f"color: {Colors.TEXT}; font-weight: 600; font-size: 13px;")
+        header.addWidget(t)
+        header.addStretch()
+        layout.addLayout(header)
 
         d = QLabel(desc)
         d.setWordWrap(True)
@@ -56,7 +61,6 @@ class _ActionCard(QFrame):
 
 
 class DropZone(QFrame):
-    """Drag-and-drop zone for files."""
     files_dropped = Signal(list)
 
     def __init__(self):
@@ -69,9 +73,14 @@ class DropZone(QFrame):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
 
+        upload_lbl = QLabel()
+        upload_lbl.setPixmap(icon("upload", Colors.TEXT_MUTED, 32).pixmap(32, 32))
+        upload_lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(upload_lbl)
+
         lbl = QLabel("Drop files here")
         lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 16px; font-weight: 600;")
+        lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 14px; font-weight: 600;")
         layout.addWidget(lbl)
 
         sub = QLabel("Vectors, documents, images, PDFs")
@@ -94,7 +103,7 @@ class DropZone(QFrame):
                 DropZone {{
                     border: 2px dashed {Colors.ACCENT};
                     border-radius: 12px;
-                    background-color: rgba(245,158,11,0.05);
+                    background-color: rgba(245,158,11,0.04);
                 }}
             """)
 
@@ -126,51 +135,39 @@ class WelcomeView(QWidget):
         layout.setContentsMargins(40, 30, 40, 20)
         layout.setSpacing(24)
 
-        # Header
         header = QVBoxLayout()
         header.setSpacing(4)
-
         title = QLabel("SplatsDB")
-        title.setStyleSheet(f"""
-            color: {Colors.TEXT};
-            font-size: 28px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-        """)
+        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;")
         header.addWidget(title)
-
         subtitle = QLabel("Vector search engine with semantic memory")
         subtitle.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 14px;")
         header.addWidget(subtitle)
         layout.addLayout(header)
 
-        # Drop zone
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._on_files_dropped)
         layout.addWidget(self.drop_zone)
 
-        # Quick actions grid
         grid = QGridLayout()
         grid.setSpacing(12)
 
         actions = [
-            ("search",      f"{SEARCH} Search",        "Query your vector store"),
-            ("collections", f"{COLLECTION} Collections","Manage data collections"),
-            ("graph",       f"{GRAPH} Graph",          "Knowledge graph explorer"),
-            ("spatial",     f"{SPATIAL} Spatial",       "Memory spaces navigator"),
-            ("ocr",         f"{OCR} OCR Pipeline",     "Image/PDF to searchable text"),
-            ("config",      "Config",                   "Engine configuration"),
+            ("search",      "Search",        "Query your vector store",       "search"),
+            ("collections", "Collections",   "Manage data collections",       "database"),
+            ("graph",       "Graph",         "Knowledge graph explorer",      "graph"),
+            ("spatial",     "Spatial",       "Memory spaces navigator",       "spatial"),
+            ("ocr",         "OCR Pipeline",  "Image/PDF to searchable text",  "ocr"),
+            ("config",      "Config",        "Engine configuration",          "config"),
         ]
 
-        for i, (aid, title, desc) in enumerate(actions):
-            card = _ActionCard(aid, title, desc)
+        for i, (aid, title, desc, ico) in enumerate(actions):
+            card = ActionCard(aid, title, desc, ico)
             card.clicked.connect(self._on_action)
             grid.addWidget(card, i // 3, i % 3)
-
         layout.addLayout(grid)
         layout.addStretch()
 
-        # Model selector at bottom
         bottom = QHBoxLayout()
         bottom.addWidget(QLabel("Embedding model:"))
         self.model_combo = QComboBox()

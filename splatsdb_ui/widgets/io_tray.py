@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0
-"""IO Tray — input/output thumbnails at bottom."""
+"""IO Tray."""
 
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QScrollArea, QFrame, QVBoxLayout,
+    QWidget, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QFrame,
 )
 from PySide6.QtCore import Qt
 from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import icon
 
 
 class IOTray(QWidget):

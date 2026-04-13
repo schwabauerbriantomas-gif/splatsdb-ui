@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Benchmark view — performance testing dashboard."""
+"""Benchmark view."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QGroupBox, QFormLayout, QSpinBox, QComboBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QComboBox,
 )
-from PySide6.QtCore import Qt
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import BENCHMARK, PLAY
+from splatsdb_ui.utils.icons import icon
 
 
 class BenchmarkView(QWidget):
@@ -29,50 +27,49 @@ class BenchmarkView(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        run_btn = QPushButton(f"{PLAY} Run Benchmark")
+        run_btn = QPushButton("Run Benchmark")
+        run_btn.setIcon(icon("zap", Colors.BG))
         run_btn.setProperty("class", "primary")
         header.addWidget(run_btn)
         layout.addLayout(header)
 
-        # Tabs
         tabs = QTabWidget()
 
-        # Search perf tab
-        search_tab = QWidget()
-        search_layout = QVBoxLayout(search_tab)
+        # Search tab
+        t1 = QWidget()
+        t1l = QVBoxLayout(t1)
         self.search_table = QTableWidget()
         self.search_table.setColumnCount(5)
         self.search_table.setHorizontalHeaderLabels(["Metric", "CPU", "GPU", "Speedup", "Notes"])
         self.search_table.horizontalHeader().setStretchLastSection(True)
         self.search_table.setRowCount(4)
-        for i, metric in enumerate(["QPS", "Latency p50", "Latency p99", "Recall@10"]):
-            self.search_table.setItem(i, 0, QTableWidgetItem(metric))
-        search_layout.addWidget(self.search_table)
-        tabs.addTab(search_tab, "Search")
+        for i, m in enumerate(["QPS", "Latency p50", "Latency p99", "Recall@10"]):
+            self.search_table.setItem(i, 0, QTableWidgetItem(m))
+        t1l.addWidget(self.search_table)
+        tabs.addTab(t1, "Search")
 
         # HNSW tab
-        hnsw_tab = QWidget()
-        hnsw_layout = QVBoxLayout(hnsw_tab)
+        t2 = QWidget()
+        t2l = QVBoxLayout(t2)
         self.hnsw_table = QTableWidget()
         self.hnsw_table.setColumnCount(4)
         self.hnsw_table.setHorizontalHeaderLabels(["M", "EF Construct", "Recall", "Build Time"])
         self.hnsw_table.horizontalHeader().setStretchLastSection(True)
-        hnsw_layout.addWidget(self.hnsw_table)
-        tabs.addTab(hnsw_tab, "HNSW")
+        t2l.addWidget(self.hnsw_table)
+        tabs.addTab(t2, "HNSW")
 
         # Ingestion tab
-        ingest_tab = QWidget()
-        ingest_layout = QVBoxLayout(ingest_tab)
+        t3 = QWidget()
+        t3l = QVBoxLayout(t3)
         self.ingest_table = QTableWidget()
         self.ingest_table.setColumnCount(4)
         self.ingest_table.setHorizontalHeaderLabels(["Batch Size", "Vectors/sec", "Total Time", "Memory"])
         self.ingest_table.horizontalHeader().setStretchLastSection(True)
-        ingest_layout.addWidget(self.ingest_table)
-        tabs.addTab(ingest_tab, "Ingestion")
+        t3l.addWidget(self.ingest_table)
+        tabs.addTab(t3, "Ingestion")
 
         layout.addWidget(tabs, stretch=1)
 
-        # Config
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Dataset:"))
         self.dataset_combo = QComboBox()

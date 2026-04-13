@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Job queue panel — background operation progress."""
+"""Job queue panel."""
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QFrame,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QFrame,
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import CHECK, CROSS
+from splatsdb_ui.utils.icons import icon
 
 
 class JobItem(QFrame):
@@ -65,7 +66,6 @@ class JobQueuePanel(QWidget):
 
         self._jobs_layout = QVBoxLayout()
         self._layout.addLayout(self._jobs_layout)
-
         self.setStyleSheet(f"background-color: {Colors.BG_RAISED};")
 
     def add_job(self, job_id: str, description: str):
@@ -78,10 +78,10 @@ class JobQueuePanel(QWidget):
         item = self._jobs.get(job_id)
         if item:
             if success:
-                item.status_label.setText(f"{CHECK} Done")
+                item.status_label.setText("Done")
                 item.status_label.setStyleSheet(f"color: {Colors.SUCCESS}; font-size: 11px;")
             else:
-                item.status_label.setText(f"{CROSS} Failed")
+                item.status_label.setText("Failed")
                 item.status_label.setStyleSheet(f"color: {Colors.ERROR}; font-size: 11px;")
 
     def update_job(self, job_id: str, progress: int):

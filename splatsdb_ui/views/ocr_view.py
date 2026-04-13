@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0
-"""OCR view — image/PDF to searchable text pipeline."""
+"""OCR view."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import OCR, SEARCH, FILE, REFRESH
+from splatsdb_ui.utils.icons import icon
 
 
 class OCRView(QWidget):
@@ -31,39 +31,36 @@ class OCRView(QWidget):
         header.addStretch()
         layout.addLayout(header)
 
-        # File input
         file_row = QHBoxLayout()
         self.file_label = QLineEdit()
         self.file_label.setPlaceholderText("Select image or PDF...")
         self.file_label.setReadOnly(True)
         file_row.addWidget(self.file_label, stretch=1)
 
-        browse_btn = QPushButton(f"{FILE} Browse")
+        browse_btn = QPushButton("Browse")
+        browse_btn.setIcon(icon("folder", Colors.TEXT))
         browse_btn.clicked.connect(self._browse_file)
         file_row.addWidget(browse_btn)
         layout.addLayout(file_row)
 
-        # Options row
         options = QHBoxLayout()
         options.addWidget(QLabel("Engine:"))
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(["Tesseract", "PaddleOCR"])
         options.addWidget(self.engine_combo)
-
         options.addWidget(QLabel("Language:"))
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(["spa", "eng", "por", "fra", "deu"])
         self.lang_combo.setCurrentText("spa")
         options.addWidget(self.lang_combo)
 
-        run_btn = QPushButton(f"{SEARCH} Extract Text")
+        run_btn = QPushButton("Extract Text")
+        run_btn.setIcon(icon("search", Colors.BG))
         run_btn.setProperty("class", "primary")
         options.addWidget(run_btn)
-
         options.addStretch()
         layout.addLayout(options)
 
-        # Progress
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -71,20 +68,17 @@ class OCRView(QWidget):
         self.progress.setTextVisible(False)
         layout.addWidget(self.progress)
 
-        # Splitter: preview | text output
         splitter = QSplitter(Qt.Horizontal)
 
-        # Preview
-        preview_frame = QFrame()
-        preview_layout = QVBoxLayout(preview_frame)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview = QFrame()
+        pl = QVBoxLayout(preview)
+        pl.setContentsMargins(0, 0, 0, 0)
         self.preview_label = QLabel("No file loaded")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet(f"color: {Colors.TEXT_MUTED};")
-        preview_layout.addWidget(self.preview_label)
-        splitter.addWidget(preview_frame)
+        pl.addWidget(self.preview_label)
+        splitter.addWidget(preview)
 
-        # Text output
         self.text_output = QTextEdit()
         self.text_output.setReadOnly(True)
         self.text_output.setPlaceholderText("Extracted text will appear here...")
@@ -93,12 +87,14 @@ class OCRView(QWidget):
         splitter.setSizes([400, 600])
         layout.addWidget(splitter, stretch=1)
 
-        # Bottom actions
         actions = QHBoxLayout()
         embed_btn = QPushButton("Embed & Store")
+        embed_btn.setIcon(icon("download", Colors.BG))
         embed_btn.setProperty("class", "primary")
         actions.addWidget(embed_btn)
-        actions.addWidget(QPushButton("Copy Text"))
+        copy_btn = QPushButton("Copy Text")
+        copy_btn.setIcon(icon("copy", Colors.TEXT))
+        actions.addWidget(copy_btn)
         actions.addStretch()
         layout.addLayout(actions)
 
@@ -113,7 +109,7 @@ class OCRView(QWidget):
 
     def get_params(self) -> list:
         return [
-            {"name": "ocr_engine", "label": "Engine", "type": "combo", "options": ["tesseract", "paddleocr"], "default": "tesseract"},
-            {"name": "ocr_lang", "label": "Language", "type": "combo", "options": ["spa", "eng", "por", "fra", "deu"], "default": "spa"},
+            {"name": "ocr_engine", "label": "Engine", "type": "combo", "options": ["tesseract", "paddleocr"]},
+            {"name": "ocr_lang", "label": "Language", "type": "combo", "options": ["spa", "eng", "por", "fra", "deu"]},
             {"name": "auto_embed", "label": "Auto-embed", "type": "check", "default": True},
         ]

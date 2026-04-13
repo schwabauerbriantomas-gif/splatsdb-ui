@@ -1,68 +1,112 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Icon system — clean geometric Unicode symbols. No emojis.
+"""Icon system — SVG icons loaded as QIcon.
 
-Consistent visual language across the entire UI:
-  - Navigation: filled geometric shapes
-  - Actions: arrows, plus, minus, check
-  - Status: dots, circles
-  - Indicators: squares, diamonds, triangles
+Lucide-style line icons (24x24, 1.5px stroke).
+Each icon visually represents its function.
 """
 
-# Navigation / View icons (used in tabs, sidebar, menus)
-HOME       = "\u25C6"   # ◆ Diamond
-SEARCH     = "\u25B8"   # ▸ Right triangle
-COLLECTION = "\u25A0"   # ■ Square
-GRAPH      = "\u25C7"   # ◇ Diamond outline
-SPATIAL    = "\u25CB"   # ○ Circle outline
-CLUSTER    = "\u25BD"   # ▽ Down triangle
-BENCHMARK  = "\u25B2"   # ▲ Up triangle
-OCR        = "\u25A1"   # □ Square outline
-CONFIG     = "\u2699"   # ⚙ Gear
+from __future__ import annotations
 
-# Status indicators
-DOT_ON     = "\u25CF"   # ● Filled circle
-DOT_OFF    = "\u25CB"   # ○ Open circle
-DOT_WARN   = "\u25D0"   # ◐ Half circle
-DOT_ERR    = "\u25D1"   # ◑ Half circle (reverse)
+from pathlib import Path
+from typing import Optional
 
-# Actions
-PLAY       = "\u25B6"   # ▶ Play
-STOP       = "\u25A0"   # ■ Stop (square)
-PAUSE      = "\u2590"   # ▐ Pause bar
-REFRESH    = "\u21BB"   # ↻ Refresh
-ADD        = "\u002B"   # + Plus
-REMOVE     = "\u2212"   # − Minus
-CHECK      = "\u2713"   # ✓ Check
-CROSS      = "\u2717"   # ✗ Cross
-ARROW_R    = "\u2192"   # → Right arrow
-ARROW_D    = "\u2193"   # ↓ Down arrow
-ARROW_U    = "\u2191"   # ↑ Up arrow
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
+from PySide6.QtCore import QSize, Qt, QRectF
+from PySide6.QtSvg import QSvgRenderer
 
-# Content types
-FILE       = "\u25A3"   # ▣ Square with fill
-FOLDER     = "\u25A4"   # ▤ Square with lines
-LINK       = "\u2194"   # ↔ Left-right arrow
-IMAGE      = "\u25A8"   # ▨ Square with dots
-TEXT       = "\u25A9"   # ▩ Square with crosshatch
+_ICONS_DIR = Path(__file__).parent.parent / "resources" / "icons"
+_cache: dict[str, QIcon] = {}
 
-# Misc
-GEAR       = "\u2699"   # ⚙ Gear
-PIN        = "\u25C8"   # ◈ Diamond with dot
-BULLET     = "\u2022"   # • Bullet
-PIPE       = "\u2502"   # │ Vertical bar
-SEPARATOR  = "\u2500"   # ─ Horizontal bar
 
-# Tab labels (icon + text)
+def _tint_svg(svg_path: Path, color: str = "#d1d5db") -> bytes:
+    """Read SVG and inject currentColor as the actual stroke/fill color."""
+    data = svg_path.read_bytes()
+    # Replace currentColor with actual color
+    data = data.replace(b"currentColor", color.encode())
+    return data
+
+
+def icon(name: str, color: str = "#d1d5db", size: int = 20) -> QIcon:
+    """Get a cached QIcon by name, tinted to color."""
+    key = f"{name}:{color}:{size}"
+    if key in _cache:
+        return _cache[key]
+
+    svg_path = _ICONS_DIR / f"{name}.svg"
+    if not svg_path.exists():
+        # Fallback: empty icon
+        return QIcon()
+
+    # Render SVG to pixmap with tint
+    svg_data = _tint_svg(svg_path, color)
+    renderer = QSvgRenderer(svg_data)
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    renderer.render(painter)
+    painter.end()
+
+    qicon = QIcon(pixmap)
+    _cache[key] = qicon
+    return qicon
+
+
+def pixmap(name: str, color: str = "#d1d5db", size: int = 20) -> QPixmap:
+    """Get a QPixmap for direct drawing."""
+    return icon(name, color, size).pixmap(QSize(size, size))
+
+
+# Convenience: get icon with theme colors
+from splatsdb_ui.utils.theme import Colors
+
+
+def icon_normal(name: str) -> QIcon:
+    return icon(name, Colors.TEXT)
+
+
+def icon_dim(name: str) -> QIcon:
+    return icon(name, Colors.TEXT_DIM)
+
+
+def icon_accent(name: str) -> QIcon:
+    return icon(name, Colors.ACCENT)
+
+
+def icon_success(name: str) -> QIcon:
+    return icon(name, Colors.SUCCESS)
+
+
+def icon_error(name: str) -> QIcon:
+    return icon(name, Colors.ERROR)
+
+
+# Tab labels
 def tab_label(view_id: str) -> str:
+    """Plain text tab label — icon set via QTabWidget icon."""
     labels = {
-        "welcome":     f"{HOME} Home",
-        "search":      f"{SEARCH} Search",
-        "collections": f"{COLLECTION} Collections",
-        "graph":       f"{GRAPH} Graph",
-        "spatial":     f"{SPATIAL} Spatial",
-        "cluster":     f"{CLUSTER} Cluster",
-        "benchmark":   f"{BENCHMARK} Benchmark",
-        "ocr":         f"{OCR} OCR",
-        "config":      f"{GEAR} Config",
+        "welcome":     "Home",
+        "search":      "Search",
+        "collections": "Collections",
+        "graph":       "Graph",
+        "spatial":     "Spatial",
+        "cluster":     "Cluster",
+        "benchmark":   "Benchmark",
+        "ocr":         "OCR",
+        "config":      "Config",
     }
     return labels.get(view_id, view_id.title())
+
+
+TAB_ICONS = {
+    "welcome":     "home",
+    "search":      "search",
+    "collections": "database",
+    "graph":       "graph",
+    "spatial":     "spatial",
+    "cluster":     "cluster",
+    "benchmark":   "benchmark",
+    "ocr":         "ocr",
+    "config":      "config",
+}
