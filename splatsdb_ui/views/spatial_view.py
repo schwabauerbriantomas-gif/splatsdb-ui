@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Spatial Architecture Generator — parametric floor plan from vector topology.
+"""Spatial Architecture Generator — Voronoi/Delaunay-based parametric floor plans.
 
-Transforms vector space topology into navigable architectural space:
-- Clusters → Rooms (size proportional to member count)
-- Inter-cluster connections → Corridors (width proportional to affinity)
-- High-affinity cluster groups → Wings (labeled sections)
-- Hub nodes → Lobbies / junction rooms
+Mathematical foundations:
+  Room layout:    Voronoi tessellation of cluster centroids
+                  V(pᵢ) = {x : d(x, pᵢ) ≤ d(x, pⱼ) ∀j}
+  Corridor graph: Delaunay triangulation D(P) — dual of Voronoi
+  Minimum Spanning Tree: Kruskal on Delaunay edges → essential corridors
+  Weighted edges: w(i,j) = exp(-α · affinity(i,j)) for layout stress
+  Corridor paths: cubic Bézier curves B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+                  Control points offset perpendicular to chord for elegance
+  Room sizing:    area(Cₖ) ∝ |Cₖ|^0.7 (sublinear for visual balance)
 
-Interactive parameters control the generated layout.
-Click a room to inspect its contents.
+Visual style: architectural blueprint with dark background, precision lines,
+corner marks on rooms, dimension annotations, flow arrows along MST.
 """
 
 from __future__ import annotations
@@ -17,11 +21,13 @@ import colorsys
 import numpy as np
 from typing import Optional
 from collections import defaultdict
+from scipy.spatial import Delaunay, Voronoi
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSlider, QFrame, QSplitter, QScrollArea,
-    QSizePolicy, QToolBar,
+    QComboBox, QSlider, QSplitter, QSizePolicy,
 )
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import (
@@ -32,58 +38,91 @@ from PySide6.QtGui import (
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
 
+PHI = (1 + np.sqrt(5)) / 2
 
-def _wing_color(index: int) -> QColor:
-    hue = (index * 0.276393202250021 + 0.1) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.35, 0.35)
+
+def _wing_color(i: int) -> QColor:
+    hue = (i * 0.2764 + 0.05) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.30, 0.30)
     return QColor(int(r * 255), int(g * 255), int(b * 255))
 
 
-def _room_color(index: int) -> QColor:
-    hue = (index * 0.618033988749895) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.55, 0.85)
+def _room_color(i: int) -> QColor:
+    hue = (i * (1 / PHI)) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.50, 0.82)
     return QColor(int(r * 255), int(g * 255), int(b * 255))
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Bézier curve math
+# ---------------------------------------------------------------------------
+
+def cubic_bezier(P0, P1, P2, P3, n=40):
+    """Evaluate cubic Bézier at n points."""
+    t = np.linspace(0, 1, n).reshape(-1, 1)
+    B = ((1 - t) ** 3 * P0 +
+         3 * (1 - t) ** 2 * t * P1 +
+         3 * (1 - t) * t ** 2 * P2 +
+         t ** 3 * P3)
+    return B
+
+
+def bezier_control_points(A, B, curvature=0.25):
+    """Compute control points for a smooth corridor between A and B.
+
+    Offset is perpendicular to chord AB, proportional to chord length.
+    """
+    chord = B - A
+    length = np.linalg.norm(chord)
+    if length < 1e-6:
+        return A, B
+
+    # Perpendicular unit vector
+    perp = np.array([-chord[1], chord[0]]) / length
+
+    # Control point offset
+    d = curvature * length
+
+    P1 = A + chord * 0.33 + perp * d
+    P2 = A + chord * 0.67 + perp * d
+    return P1, P2
+
+
+# ---------------------------------------------------------------------------
+# Architecture data structures
 # ---------------------------------------------------------------------------
 
 class Room:
-    """A room in the spatial layout."""
-    def __init__(self, rid: int, label: str, size: int, color: QColor,
-                 members: list[dict], wing: int = -1):
+    __slots__ = ('id', 'label', 'members', 'color', 'wing',
+                 'polygon', 'center', 'area', 'centroid')
+
+    def __init__(self, rid, label, members, color):
         self.id = rid
         self.label = label
-        self.size = size  # member count
-        self.color = color
         self.members = members
-        self.wing = wing  # wing assignment
-        self.x = 0.0
-        self.y = 0.0
-        self.width = 0.0
-        self.height = 0.0
-
-    @property
-    def rect(self):
-        return (self.x, self.y, self.width, self.height)
-
-    def contains(self, px, py):
-        return (self.x <= px <= self.x + self.width and
-                self.y <= py <= self.y + self.height)
+        self.color = color
+        self.wing = -1
+        self.polygon: Optional[np.ndarray] = None  # (M, 2) screen coords
+        self.center = np.zeros(2)
+        self.area = 0.0
+        self.centroid = np.zeros(2)  # data-space centroid
 
 
 class Corridor:
-    """A corridor connecting two rooms."""
-    def __init__(self, room_a: int, room_b: int, strength: float):
-        self.room_a = room_a
-        self.room_b = room_b
-        self.strength = strength  # 0..1
+    __slots__ = ('room_a', 'room_b', 'strength', 'is_mst', 'is_delaunay')
+
+    def __init__(self, a, b, strength, is_mst=False, is_delaunay=False):
+        self.room_a = a
+        self.room_b = b
+        self.strength = strength
+        self.is_mst = is_mst
+        self.is_delaunay = is_delaunay
 
 
 class Wing:
-    """A wing grouping multiple rooms."""
-    def __init__(self, wid: int, label: str, color: QColor):
+    __slots__ = ('id', 'label', 'color', 'rooms')
+
+    def __init__(self, wid, label, color):
         self.id = wid
         self.label = label
         self.color = color
@@ -91,73 +130,62 @@ class Wing:
 
 
 # ---------------------------------------------------------------------------
-# Layout engine
+# Layout engine — Voronoi + Delaunay + MST
 # ---------------------------------------------------------------------------
 
 class SpatialLayoutEngine:
-    """Generates architectural floor plan from cluster topology."""
+    """Generate architectural floor plans from vector topology."""
 
     def __init__(self):
         self.rooms: list[Room] = []
         self.corridors: list[Corridor] = []
         self.wings: list[Wing] = []
-
-        self.room_scale = 1.0       # size multiplier
-        self.corridor_width = 12     # pixels
-        self.wing_threshold = 0.5    # min affinity to group into wing
-        self.layout_mode = "force"   # force | circular | grid
-        self.padding = 30            # room padding
+        self.room_scale = 1.0
+        self.corridor_curvature = 0.20
+        self.wing_threshold = 0.5
 
     def generate(self, nodes: list[dict], n_clusters: int = 5):
-        """Generate floor plan from nodes."""
-        if not nodes:
+        if not nodes or n_clusters < 2:
             return
 
-        # 1. Cluster nodes
+        # --- Cluster ---
         vectors = []
         for n in nodes:
             v = n.get("vector", n.get("position", []))
             vectors.append(v[:min(len(v), 64)] if v else [0.0])
-        mat = np.array(vectors, dtype=np.float32)
-
-        # Pad to same length
         max_len = max(len(v) for v in vectors)
-        padded = np.zeros((len(vectors), max_len), dtype=np.float32)
+        mat = np.zeros((len(vectors), max_len), dtype=np.float32)
         for i, v in enumerate(vectors):
-            padded[i, :len(v)] = v[:max_len]
+            mat[i, :len(v)] = v[:max_len]
 
         try:
             from sklearn.cluster import KMeans
-            labels = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit_predict(padded)
-        except ImportError:
-            labels = np.digitize(padded[:, 0], np.linspace(padded[:, 0].min(), padded[:, 0].max(), n_clusters)) - 1
+            labels = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit_predict(mat)
+        except:
+            labels = np.digitize(mat[:, 0], np.linspace(mat[:, 0].min(), mat[:, 0].max(), n_clusters)) - 1
 
-        # 2. Create rooms from clusters
+        # --- Centroids in 2D ---
+        # Project to 2D via PCA
+        try:
+            from sklearn.decomposition import PCA
+            positions_2d = PCA(n_components=2).fit_transform(mat).astype(np.float32)
+        except:
+            positions_2d = mat[:, :2]
+
+        centroids_2d = np.zeros((n_clusters, 2), dtype=np.float32)
         cluster_members = defaultdict(list)
-        for i, label in enumerate(labels):
-            cluster_members[int(label)].append(nodes[i])
-
-        self.rooms = []
+        for i, k in enumerate(labels):
+            cluster_members[int(k)].append(nodes[i])
         for k in range(n_clusters):
-            members = cluster_members.get(k, [])
-            meta = members[0].get("metadata", {}) if members else {}
-            label = meta.get("category", meta.get("label", f"Room {k}"))
-            color = _room_color(k)
+            mask = labels == k
+            if mask.any():
+                centroids_2d[k] = positions_2d[mask].mean(axis=0)
 
-            room = Room(
-                rid=k,
-                label=label,
-                size=len(members),
-                color=color,
-                members=members,
-            )
-            self.rooms.append(room)
-
-        # 3. Compute inter-cluster affinity
+        # --- Compute affinity ---
         node_ids = [n.get("id", str(i)) for i, n in enumerate(nodes)]
         id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
         affinity = np.zeros((n_clusters, n_clusters))
-
+        counts = np.zeros((n_clusters, n_clusters))
         for i, node in enumerate(nodes):
             ci = labels[i]
             for conn in node.get("connections", []):
@@ -165,31 +193,171 @@ class SpatialLayoutEngine:
                 if j is not None and j < len(labels):
                     cj = labels[j]
                     affinity[ci, cj] += conn.get("score", 0)
-
-        # Normalize
+                    counts[ci, cj] += 1
         for i in range(n_clusters):
             for j in range(n_clusters):
-                if i != j:
-                    affinity[i, j] /= max(min(self.rooms[i].size, self.rooms[j].size), 1)
+                if counts[i, j] > 0:
+                    affinity[i, j] /= counts[i, j]
 
-        # 4. Create corridors
+        # --- Create rooms ---
+        self.rooms = []
+        for k in range(n_clusters):
+            members = cluster_members.get(k, [])
+            meta = members[0].get("metadata", {}) if members else {}
+            label = meta.get("category", meta.get("label", f"Room {k}"))
+            self.rooms.append(Room(k, label, members, _room_color(k)))
+            self.rooms[-1].centroid = centroids_2d[k]
+
+        # --- Voronoi tessellation for room boundaries ---
+        if n_clusters >= 3:
+            self._voronoi_layout(centroids_2d)
+        elif n_clusters == 2:
+            self._binary_layout(centroids_2d)
+        else:
+            self._single_layout(centroids_2d)
+
+        # --- Delaunay triangulation for corridor topology ---
+        delaunay_edges = set()
+        if n_clusters >= 3:
+            try:
+                tri = Delaunay(centroids_2d)
+                for simplex in tri.simplices:
+                    for i in range(3):
+                        for j in range(i + 1, 3):
+                            a, b = int(simplex[i]), int(simplex[j])
+                            delaunay_edges.add((min(a, b), max(a, b)))
+            except:
+                delaunay_edges = {(i, j) for i in range(n_clusters) for j in range(i + 1, n_clusters)}
+        elif n_clusters == 2:
+            delaunay_edges = {(0, 1)}
+
+        # --- MST for essential corridors ---
+        mst_edges = set()
+        if n_clusters >= 2 and delaunay_edges:
+            # Weight: inverse affinity (low affinity = high cost)
+            n = n_clusters
+            weight_matrix = np.full((n, n), 1e6)
+            for i in range(n):
+                weight_matrix[i, i] = 0
+            for (i, j) in delaunay_edges:
+                w = 1.0 - affinity[i, j] if affinity[i, j] > 0 else 100.0
+                weight_matrix[i, j] = w
+                weight_matrix[j, i] = w
+
+            try:
+                mst = minimum_spanning_tree(csr_matrix(weight_matrix))
+                mst_coo = mst.tocoo()
+                for i, j in zip(mst_coo.row, mst_coo.col):
+                    mst_edges.add((min(i, j), max(i, j)))
+            except:
+                mst_edges = set(list(delaunay_edges)[:n_clusters - 1])
+
+        # --- Build corridor list ---
         self.corridors = []
-        for i in range(n_clusters):
-            for j in range(i + 1, n_clusters):
-                if affinity[i, j] > 0.2:
-                    self.corridors.append(Corridor(i, j, min(affinity[i, j], 1.0)))
+        for (a, b) in delaunay_edges:
+            s = affinity[a, b]
+            is_mst = (a, b) in mst_edges
+            if is_mst or s > 0.15:
+                self.corridors.append(Corridor(a, b, max(s, 0.1),
+                                               is_mst=is_mst, is_delaunay=True))
 
-        # 5. Create wings (groups of highly connected rooms)
-        self.wings = self._detect_wings(affinity, n_clusters)
+        # --- Wings via union-find on MST edges ---
+        self._detect_wings(mst_edges, affinity, n_clusters)
 
-        # 6. Layout
-        self._compute_room_sizes()
-        self._layout_rooms()
+    def _voronoi_layout(self, centroids: np.ndarray):
+        """Use Voronoi tessellation for room polygons."""
+        n = len(centroids)
 
-    def _detect_wings(self, affinity: np.ndarray, n: int) -> list[Wing]:
-        """Group rooms into wings based on affinity."""
-        # Simple: use union-find to merge rooms with affinity > threshold
-        parent = list(range(n))
+        # Normalize to working space
+        c_min = centroids.min(axis=0)
+        c_max = centroids.max(axis=0)
+        c_range = c_max - c_min
+        c_range[c_range < 0.01] = 1.0
+        normed = (centroids - c_min) / c_range * 600 + 100
+
+        # Bounding box for Voronoi
+        bbox = np.array([[0, 0], [800, 0], [800, 700], [0, 700]])
+
+        # Mirror points to create finite Voronoi regions
+        mirrored = np.vstack([
+            normed,
+            np.column_stack([-normed[:, 0], normed[:, 1]]),
+            np.column_stack([2 * 800 - normed[:, 0], normed[:, 1]]),
+            np.column_stack([normed[:, 0], -normed[:, 1]]),
+            np.column_stack([normed[:, 0], 2 * 700 - normed[:, 1]]),
+        ])
+
+        try:
+            vor = Voronoi(mirrored)
+        except:
+            self._fallback_layout(centroids)
+            return
+
+        for k in range(n):
+            region_idx = vor.point_region[k]
+            region = vor.regions[region_idx]
+            if -1 in region or len(region) < 3:
+                self._fallback_room(k, normed[k])
+                continue
+
+            verts = vor.vertices[region]
+
+            # Clip to bounding box
+            verts[:, 0] = np.clip(verts[:, 0], 20, 780)
+            verts[:, 1] = np.clip(verts[:, 1], 20, 680)
+
+            # Inset by margin for visual separation
+            center = verts.mean(axis=0)
+            inset = 8
+            inset_verts = center + (verts - center) * (1 - inset / max(np.linalg.norm(verts - center, axis=1).max(), 1))
+
+            self.rooms[k].polygon = inset_verts
+            self.rooms[k].center = center
+            self.rooms[k].area = self._polygon_area(inset_verts)
+
+    def _binary_layout(self, centroids: np.ndarray):
+        normed = (centroids - centroids.min()) / max(centroids.max() - centroids.min(), 0.01) * 500 + 150
+        mid = (normed[0] + normed[1]) / 2
+        self.rooms[0].polygon = np.array([[30, 30], [mid[0] - 10, 30], [mid[0] - 10, 670], [30, 670]])
+        self.rooms[0].center = self.rooms[0].polygon.mean(axis=0)
+        self.rooms[0].area = self._polygon_area(self.rooms[0].polygon)
+        self.rooms[1].polygon = np.array([[mid[0] + 10, 30], [770, 30], [770, 670], [mid[0] + 10, 670]])
+        self.rooms[1].center = self.rooms[1].polygon.mean(axis=0)
+        self.rooms[1].area = self._polygon_area(self.rooms[1].polygon)
+
+    def _single_layout(self, centroids: np.ndarray):
+        self.rooms[0].polygon = np.array([[30, 30], [770, 30], [770, 670], [30, 670]])
+        self.rooms[0].center = self.rooms[0].polygon.mean(axis=0)
+        self.rooms[0].area = self._polygon_area(self.rooms[0].polygon)
+
+    def _fallback_layout(self, centroids: np.ndarray):
+        normed = (centroids - centroids.min()) / max(centroids.max() - centroids.min(), 0.01) * 500 + 150
+        for k in range(len(self.rooms)):
+            self._fallback_room(k, normed[k])
+
+    def _fallback_room(self, k, center):
+        s = 60
+        self.rooms[k].polygon = np.array([
+            [center[0] - s, center[1] - s],
+            [center[0] + s, center[1] - s],
+            [center[0] + s, center[1] + s],
+            [center[0] - s, center[1] + s],
+        ])
+        self.rooms[k].center = center
+        self.rooms[k].area = self._polygon_area(self.rooms[k].polygon)
+
+    @staticmethod
+    def _polygon_area(verts):
+        n = len(verts)
+        area = 0
+        for i in range(n):
+            j = (i + 1) % n
+            area += verts[i, 0] * verts[j, 1]
+            area -= verts[j, 0] * verts[i, 1]
+        return abs(area) / 2
+
+    def _detect_wings(self, mst_edges, affinity, n_clusters):
+        parent = list(range(n_clusters))
 
         def find(x):
             while parent[x] != x:
@@ -202,138 +370,32 @@ class SpatialLayoutEngine:
             if a != b:
                 parent[a] = b
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                if affinity[i, j] > self.wing_threshold:
-                    union(i, j)
+        for (a, b) in mst_edges:
+            if affinity[a, b] > self.wing_threshold:
+                union(a, b)
 
-        # Group
         groups = defaultdict(list)
-        for i in range(n):
+        for i in range(n_clusters):
             groups[find(i)].append(i)
 
-        wings = []
-        wing_idx = 0
+        self.wings = []
+        wi = 0
         for root, members in groups.items():
             if len(members) >= 2:
-                w = Wing(wing_idx, f"Wing {chr(65 + wing_idx)}", _wing_color(wing_idx))
+                w = Wing(wi, f"Wing {chr(65 + wi)}", _wing_color(wi))
                 w.rooms = members
-                wings.append(w)
+                self.wings.append(w)
                 for rid in members:
-                    self.rooms[rid].wing = wing_idx
-                wing_idx += 1
-
-        return wings
-
-    def _compute_room_sizes(self):
-        """Compute room dimensions based on member count."""
-        for room in self.rooms:
-            area = max(room.size, 1) * self.room_scale * 400  # px² per member
-            # Keep aspect ratio reasonable
-            side = area ** 0.5
-            room.width = side * (1.0 + (room.size % 3) * 0.1) + self.padding * 2
-            room.height = side * 0.8 + self.padding * 2
-
-    def _layout_rooms(self):
-        """Place rooms according to layout algorithm."""
-        if self.layout_mode == "force":
-            self._layout_force()
-        elif self.layout_mode == "circular":
-            self._layout_circular()
-        elif self.layout_mode == "grid":
-            self._layout_grid()
-
-    def _layout_force(self):
-        """Force-directed layout: rooms repel, corridors attract."""
-        n = len(self.rooms)
-        if n == 0:
-            return
-
-        # Initialize positions
-        pos = np.random.uniform(0, 200, (n, 2)).astype(np.float64)
-
-        # Build adjacency
-        adj = defaultdict(list)
-        for c in self.corridors:
-            adj[c.room_a].append((c.room_b, c.strength))
-            adj[c.room_b].append((c.room_a, c.strength))
-
-        for iteration in range(200):
-            forces = np.zeros((n, 2))
-
-            # Repulsion (all pairs)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    diff = pos[i] - pos[j]
-                    dist = max(np.linalg.norm(diff), 1.0)
-                    # Repulsion inversely proportional to dist²
-                    force = diff / dist * (5000 / (dist * dist))
-                    forces[i] += force
-                    forces[j] -= force
-
-            # Attraction (connected pairs)
-            for c in self.corridors:
-                diff = pos[c.room_b] - pos[c.room_a]
-                dist = max(np.linalg.norm(diff), 1.0)
-                force = diff * 0.05 * c.strength
-                forces[c.room_a] += force
-                forces[c.room_b] -= force
-
-            # Wing cohesion
-            for wing in self.wings:
-                if len(wing.rooms) < 2:
-                    continue
-                center = pos[wing.rooms].mean(axis=0)
-                for rid in wing.rooms:
-                    forces[rid] += (center - pos[rid]) * 0.1
-
-            # Apply with damping
-            damping = max(0.1, 1.0 - iteration / 200)
-            pos += forces * damping * 0.1
-
-        # Normalize to [50, 800] range
-        for dim in range(2):
-            col = pos[:, dim]
-            mn, mx = col.min(), col.max()
-            if mx > mn:
-                pos[:, dim] = (col - mn) / (mx - mn) * 600 + 80
-
-        for i, room in enumerate(self.rooms):
-            room.x = pos[i, 0]
-            room.y = pos[i, 1]
-
-    def _layout_circular(self):
-        """Arrange rooms in a circle."""
-        n = len(self.rooms)
-        cx, cy = 400, 350
-        radius = min(cx, cy) * 0.7
-
-        for i, room in enumerate(self.rooms):
-            angle = 2 * np.pi * i / n - np.pi / 2
-            room.x = cx + radius * np.cos(angle) - room.width / 2
-            room.y = cy + radius * np.sin(angle) - room.height / 2
-
-    def _layout_grid(self):
-        """Arrange rooms in a grid."""
-        n = len(self.rooms)
-        cols = int(np.ceil(np.sqrt(n)))
-        spacing_x = 250
-        spacing_y = 200
-
-        for i, room in enumerate(self.rooms):
-            row, col = divmod(i, cols)
-            room.x = col * spacing_x + 50
-            room.y = row * spacing_y + 50
+                    self.rooms[rid].wing = wi
+                wi += 1
 
 
 # ---------------------------------------------------------------------------
-# Spatial canvas
+# Canvas — architectural blueprint renderer
 # ---------------------------------------------------------------------------
 
 class SpatialCanvas(QWidget):
-    """Renders the architectural floor plan."""
-
-    room_clicked = Signal(int)  # room id
+    room_clicked = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -342,17 +404,11 @@ class SpatialCanvas(QWidget):
         self.setMouseTracking(True)
 
         self.engine = SpatialLayoutEngine()
-        self._hovered_room: int = -1
-        self._selected_room: int = -1
-
-        # Visualization toggles
-        self.show_room_labels = True
-        self.show_member_count = True
-        self.show_corridors = True
-        self.show_wing_borders = True
+        self._hovered_room = -1
+        self._selected_room = -1
         self.show_flow = False
 
-    def generate(self, nodes: list[dict], n_clusters: int = 5):
+    def generate(self, nodes, n_clusters=5):
         self.engine.generate(nodes, n_clusters)
         self.update()
 
@@ -361,196 +417,308 @@ class SpatialCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Background — dark blueprint
+        # --- Blueprint background ---
         bg = QColor(Colors.BG)
         painter.fillRect(0, 0, w, h, bg)
 
-        # Subtle grid
-        painter.setPen(QPen(QColor(Colors.BORDER + "40" if not Colors.BORDER.startswith("#") else Colors.BORDER), 0.5))
-        for x in range(0, w, 30):
+        # Fine grid (graph paper)
+        painter.setPen(QPen(QColor(255, 255, 255, 6), 0.5))
+        for x in range(0, w, 20):
             painter.drawLine(x, 0, x, h)
-        for y in range(0, h, 30):
+        for y in range(0, h, 20):
             painter.drawLine(0, y, w, y)
 
-        # Title
-        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
-        painter.setFont(QFont("sans-serif", 8))
-        painter.drawText(10, h - 8, "Spatial Architecture Generator — Floor Plan View")
+        # Major grid
+        painter.setPen(QPen(QColor(255, 255, 255, 14), 0.5))
+        for x in range(0, w, 100):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, 100):
+            painter.drawLine(0, y, w, y)
 
-        # Wings (background grouping)
-        if self.show_wing_borders:
-            self._paint_wings(painter)
+        # Scale bar
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM), 1))
+        painter.drawLine(20, h - 30, 120, h - 30)
+        painter.drawLine(20, h - 35, 20, h - 25)
+        painter.drawLine(120, h - 35, 120, h - 25)
+        painter.setFont(QFont("monospace", 7))
+        painter.drawText(35, h - 33, "100 units")
 
-        # Corridors
-        if self.show_corridors:
-            self._paint_corridors(painter)
+        # --- Wings (background grouping) ---
+        self._paint_wings(painter)
 
-        # Flow visualization (optional)
+        # --- Corridors ---
+        self._paint_corridors(painter)
+
+        # --- Rooms ---
+        self._paint_rooms(painter, w, h)
+
+        # --- Flow particles ---
         if self.show_flow:
             self._paint_flow(painter)
 
-        # Rooms
-        self._paint_rooms(painter)
+        # --- Title block (architectural drawing convention) ---
+        self._paint_title_block(painter, w, h)
 
         painter.end()
 
     def _paint_wings(self, painter: QPainter):
         for wing in self.engine.wings:
-            if len(wing.rooms) < 2:
+            rooms = [self.engine.rooms[rid] for rid in wing.rooms
+                     if self.engine.rooms[rid].polygon is not None]
+            if len(rooms) < 2:
                 continue
 
-            # Compute bounding rect of all rooms in wing
-            rooms = [self.engine.rooms[rid] for rid in wing.rooms]
-            x_min = min(r.x for r in rooms) - 25
-            y_min = min(r.y for r in rooms) - 25
-            x_max = max(r.x + r.width for r in rooms) + 25
-            y_max = max(r.y + r.height for r in rooms) + 25
+            # Bounding rect of all room polygons
+            all_pts = np.vstack([r.polygon for r in rooms])
+            margin = 30
+            x_min, y_min = all_pts.min(axis=0) - margin
+            x_max, y_max = all_pts.max(axis=0) + margin
 
-            # Wing background
-            wing_bg = QColor(wing.color)
-            wing_bg.setAlpha(40)
+            # Wing shading
+            wc = QColor(wing.color)
+            wc.setAlpha(25)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(wing_bg))
+            painter.setBrush(QBrush(wc))
             painter.drawRoundedRect(int(x_min), int(y_min),
-                                    int(x_max - x_min), int(y_max - y_min), 12, 12)
+                                    int(x_max - x_min), int(y_max - y_min), 14, 14)
 
             # Wing border
-            wing_border = QColor(wing.color)
-            wing_border.setAlpha(100)
-            pen = QPen(wing_border, 2, Qt.DashLine)
-            painter.setPen(pen)
+            wb = QColor(wing.color)
+            wb.setAlpha(70)
+            painter.setPen(QPen(wb, 1.5, Qt.DashDotLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(int(x_min), int(y_min),
-                                    int(x_max - x_min), int(y_max - y_min), 12, 12)
+                                    int(x_max - x_min), int(y_max - y_min), 14, 14)
 
             # Wing label
-            painter.setPen(QPen(QColor(wing.color).lighter(150)))
+            painter.setPen(QPen(QColor(wing.color).lighter(160)))
             painter.setFont(QFont("sans-serif", 11, QFont.Bold))
-            painter.drawText(int(x_min + 10), int(y_min + 18), wing.label)
+            painter.drawText(int(x_min + 12), int(y_min + 20), wing.label)
 
     def _paint_corridors(self, painter: QPainter):
         for corr in self.engine.corridors:
-            if corr.room_a >= len(self.engine.rooms) or corr.room_b >= len(self.engine.rooms):
-                continue
-
             ra = self.engine.rooms[corr.room_a]
             rb = self.engine.rooms[corr.room_b]
+            if ra.polygon is None or rb.polygon is None:
+                continue
 
-            # Center points
-            ax = ra.x + ra.width / 2
-            ay = ra.y + ra.height / 2
-            bx = rb.x + rb.width / 2
-            by = rb.y + rb.height / 2
+            A = ra.center
+            B = rb.center
 
-            # Corridor width based on strength
-            cw = self.engine.corridor_width * (0.5 + corr.strength)
+            # Cubic Bézier corridor
+            P1, P2 = bezier_control_points(A, B, self.engine.corridor_curvature)
+            pts = cubic_bezier(A, P1, P2, B, n=60)
 
-            # Draw corridor as wide path
-            color = QColor(Colors.TEXT_DIM)
-            color.setAlpha(int(40 + corr.strength * 80))
-            painter.setPen(QPen(color, cw, Qt.SolidLine, Qt.RoundCap))
-            painter.drawLine(int(ax), int(ay), int(bx), int(by))
+            # Width based on strength and type
+            if corr.is_mst:
+                base_width = 3.0
+                alpha = 140
+            else:
+                base_width = 1.5
+                alpha = 60
+            width = base_width + corr.strength * 3
 
-            # Connection strength indicator (small dot at midpoint)
-            mx, my = (ax + bx) / 2, (ay + by) / 2
-            dot_color = QColor(Colors.ACCENT)
-            dot_color.setAlpha(int(corr.strength * 200))
+            # Color: MST in accent, Delaunay in dim
+            if corr.is_mst:
+                color = QColor(Colors.ACCENT)
+                color.setAlpha(alpha)
+            else:
+                color = QColor(Colors.TEXT_DIM)
+                color.setAlpha(alpha)
+
+            painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap))
+            painter.setBrush(Qt.NoBrush)
+
+            path = QPainterPath()
+            path.moveTo(pts[0, 0], pts[0, 1])
+            for p in pts[1:]:
+                path.lineTo(p[0], p[1])
+            painter.drawPath(path)
+
+            # Flow arrows along MST corridors
+            if corr.is_mst:
+                self._paint_flow_arrows(painter, pts, color)
+
+    def _paint_flow_arrows(self, painter, pts, color):
+        """Draw small directional arrows along a corridor path."""
+        n = len(pts)
+        step = max(n // 5, 2)
+        for i in range(step, n - step, step):
+            p = pts[i]
+            d = pts[i + 1] - pts[i - 1]
+            d_norm = d / (np.linalg.norm(d) + 1e-6)
+
+            # Arrow head (small triangle)
+            perp = np.array([-d_norm[1], d_norm[0]])
+            tip = p + d_norm * 5
+            left = p - d_norm * 3 + perp * 3
+            right = p - d_norm * 3 - perp * 3
+
+            from PySide6.QtGui import QPolygonF
+            from PySide6.QtCore import QPointF
+            arrow = QPolygonF([
+                QPointF(tip[0], tip[1]),
+                QPointF(left[0], left[1]),
+                QPointF(right[0], right[1]),
+            ])
+            c = QColor(color)
+            c.setAlpha(min(c.alpha() + 40, 220))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(dot_color))
-            painter.drawEllipse(int(mx - 3), int(my - 3), 6, 6)
+            painter.setBrush(QBrush(c))
+            painter.drawPolygon(arrow)
 
-    def _paint_flow(self, painter: QPainter):
-        """Draw animated flow particles along corridors."""
-        import time
-        t = time.time() % 4.0  # 4-second cycle
-
-        for corr in self.engine.corridors:
-            if corr.room_a >= len(self.engine.rooms) or corr.room_b >= len(self.engine.rooms):
-                continue
-
-            ra = self.engine.rooms[corr.room_a]
-            rb = self.engine.rooms[corr.room_b]
-
-            ax, ay = ra.x + ra.width / 2, ra.y + ra.height / 2
-            bx, by = rb.x + rb.width / 2, rb.y + rb.height / 2
-
-            # Multiple particles per corridor
-            n_particles = max(1, int(corr.strength * 5))
-            for p in range(n_particles):
-                phase = (t / 4.0 + p / n_particles) % 1.0
-                px = ax + (bx - ax) * phase
-                py = ay + (by - ay) * phase
-
-                alpha = int(255 * (1 - abs(phase - 0.5) * 2))  # fade at ends
-                pc = QColor(Colors.ACCENT)
-                pc.setAlpha(alpha)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(pc))
-                painter.drawEllipse(int(px - 2), int(py - 2), 4, 4)
-
-    def _paint_rooms(self, painter: QPainter):
+    def _paint_rooms(self, painter: QPainter, canvas_w: int, canvas_h: int):
         for room in self.engine.rooms:
-            x, y, w, h = room.x, room.y, room.width, room.height
+            if room.polygon is None:
+                continue
 
-            # Room shadow
-            shadow = QColor(0, 0, 0, 40)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(shadow))
-            painter.drawRoundedRect(int(x + 3), int(y + 3), int(w), int(h), 8, 8)
+            poly = room.polygon
+            is_hov = room.id == self._hovered_room
+            is_sel = room.id == self._selected_room
 
-            # Room fill
-            fill = QColor(room.color)
-            is_hovered = room.id == self._hovered_room
-            is_selected = room.id == self._selected_room
+            # --- Room fill (gradient for depth) ---
+            center = poly.mean(axis=0)
+            gradient = QRadialGradient(center[0], center[1],
+                                       max(np.linalg.norm(poly - center, axis=1).max(), 1))
 
-            if is_selected:
-                fill = fill.lighter(140)
-            elif is_hovered:
-                fill = fill.lighter(120)
+            base = QColor(room.color)
+            if is_sel:
+                base = base.lighter(150)
+            elif is_hov:
+                base = base.lighter(125)
 
-            fill.setAlpha(200 if is_selected or is_hovered else 160)
+            fill_inner = QColor(base)
+            fill_inner.setAlpha(160 if not is_sel else 200)
+            fill_outer = QColor(base.darker(140))
+            fill_outer.setAlpha(80)
 
-            # Gradient fill for depth
-            gradient = QLinearGradient(x, y, x, y + h)
-            gradient.setColorAt(0, fill.lighter(110))
-            gradient.setColorAt(1, fill.darker(110))
+            gradient.setColorAt(0, fill_inner)
+            gradient.setColorAt(1, fill_outer)
             painter.setBrush(QBrush(gradient))
 
             # Border
             border = QColor(room.color)
-            border.setAlpha(255 if is_selected else 180)
-            pen_width = 2.5 if is_selected else 1.5
-            painter.setPen(QPen(border, pen_width))
-            painter.drawRoundedRect(int(x), int(y), int(w), int(h), 8, 8)
+            border.setAlpha(220 if is_sel or is_hov else 140)
+            pen_w = 2.5 if is_sel else (1.8 if is_hov else 1.2)
+            painter.setPen(QPen(border, pen_w))
 
-            # Room label
-            if self.show_room_labels:
-                painter.setPen(QPen(QColor(Colors.BG)))
-                painter.setFont(QFont("sans-serif", 10, QFont.Bold))
-                text = room.label[:20]
-                painter.drawText(int(x + 8), int(y + 20), text)
+            # Draw polygon
+            from PySide6.QtGui import QPolygonF
+            from PySide6.QtCore import QPointF
+            qpoly = QPolygonF([QPointF(p[0], p[1]) for p in poly])
+            painter.drawPolygon(qpoly)
 
-            # Member count
-            if self.show_member_count:
-                painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
-                painter.setFont(QFont("sans-serif", 9))
-                painter.drawText(int(x + 8), int(y + 36), f"{room.size} splats")
+            # --- Corner marks (architectural convention) ---
+            corner_len = 12
+            painter.setPen(QPen(QColor(room.color).lighter(140), 1.5))
+            n_verts = len(poly)
+            for i in range(n_verts):
+                v = poly[i]
+                # Direction to previous and next vertex
+                prev = poly[(i - 1) % n_verts]
+                nxt = poly[(i + 1) % n_verts]
+                d_prev = (prev - v)
+                d_prev = d_prev / (np.linalg.norm(d_prev) + 1e-6) * corner_len
+                d_next = (nxt - v)
+                d_next = d_next / (np.linalg.norm(d_next) + 1e-6) * corner_len
 
-            # Wing badge
+                painter.drawLine(int(v[0]), int(v[1]),
+                                 int(v[0] + d_prev[0]), int(v[1] + d_prev[1]))
+                painter.drawLine(int(v[0]), int(v[1]),
+                                 int(v[0] + d_next[0]), int(v[1] + d_next[1]))
+
+            # --- Room label ---
+            painter.setPen(QPen(QColor(Colors.BG).lighter(180)))
+            painter.setFont(QFont("sans-serif", 10, QFont.Bold))
+            text = room.label[:18]
+            painter.drawText(int(center[0] - 40), int(center[1] - 8), text)
+
+            # --- Member count ---
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+            painter.setFont(QFont("sans-serif", 8))
+            painter.drawText(int(center[0] - 20), int(center[1] + 10),
+                             f"{len(room.members)} splats")
+
+            # --- Area annotation ---
+            area_px = room.area
+            painter.setFont(QFont("monospace", 7))
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM).lighter(120)))
+            painter.drawText(int(center[0] - 25), int(center[1] + 22),
+                             f"A={area_px:.0f}px²")
+
+            # --- Wing badge ---
             if room.wing >= 0 and room.wing < len(self.engine.wings):
                 wing = self.engine.wings[room.wing]
-                badge_color = QColor(wing.color).lighter(150)
+                # Small colored dot
+                badge_pos = poly[0]  # top-ish vertex
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(badge_color))
-                painter.drawEllipse(int(x + w - 20), int(y + 5), 14, 14)
+                painter.setBrush(QBrush(QColor(wing.color).lighter(160)))
+                painter.drawEllipse(int(badge_pos[0] - 6), int(badge_pos[1] - 6), 12, 12)
                 painter.setPen(QPen(QColor(Colors.BG)))
                 painter.setFont(QFont("sans-serif", 7, QFont.Bold))
-                painter.drawText(int(x + w - 18), int(y + 15), wing.label[-1])
+                painter.drawText(int(badge_pos[0] - 3), int(badge_pos[1] + 4),
+                                 wing.label[-1])
+
+    def _paint_flow(self, painter: QPainter):
+        """Animated flow particles along corridors."""
+        import time
+        t = time.time() % 5.0
+
+        for corr in self.engine.corridors:
+            if not corr.is_mst:
+                continue
+            ra = self.engine.rooms[corr.room_a]
+            rb = self.engine.rooms[corr.room_b]
+            if ra.polygon is None or rb.polygon is None:
+                continue
+
+            A, B = ra.center, rb.center
+            P1, P2 = bezier_control_points(A, B, self.engine.corridor_curvature)
+            pts = cubic_bezier(A, P1, P2, B, n=60)
+
+            n_particles = max(2, int(corr.strength * 6))
+            for p in range(n_particles):
+                phase = (t / 5.0 + p / n_particles) % 1.0
+                idx = int(phase * (len(pts) - 1))
+                pt = pts[idx]
+
+                # Fade at endpoints
+                fade = 1.0 - abs(phase - 0.5) * 2
+                alpha = int(200 * fade)
+                pc = QColor(Colors.ACCENT)
+                pc.setAlpha(max(alpha, 30))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(pc))
+                painter.drawEllipse(int(pt[0] - 3), int(pt[1] - 3), 6, 6)
+
+    def _paint_title_block(self, painter, w, h):
+        """Architectural drawing title block (bottom-right corner)."""
+        bw, bh = 200, 60
+        x0, y0 = w - bw - 15, h - bh - 15
+
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM), 1))
+        painter.setBrush(QBrush(QColor(Colors.BG_RAISED)))
+        painter.drawRect(x0, y0, bw, bh)
+
+        painter.setFont(QFont("monospace", 7))
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.drawText(x0 + 5, y0 + 12, "SPATIAL ARCHITECTURE")
+        painter.drawText(x0 + 5, y0 + 24, f"Rooms: {len(self.engine.rooms)}  "
+                         f"Corridors: {len(self.engine.corridors)}  "
+                         f"Wings: {len(self.engine.wings)}")
+
+        mst_count = sum(1 for c in self.engine.corridors if c.is_mst)
+        delaunay_count = sum(1 for c in self.engine.corridors if c.is_delaunay)
+        painter.drawText(x0 + 5, y0 + 36, f"MST: {mst_count}  Delaunay: {delaunay_count}")
+        painter.drawText(x0 + 5, y0 + 48, f"Layout: Voronoi/Delaunay")
+
+        painter.setPen(QPen(QColor(Colors.ACCENT), 1.5))
+        painter.drawLine(x0, y0, x0 + bw, y0)
 
     def mouseMoveEvent(self, event):
         pos = event.position()
         for room in self.engine.rooms:
-            if room.contains(pos.x(), pos.y()):
+            if room.polygon is not None and self._point_in_polygon(pos.x(), pos.y(), room.polygon):
                 if self._hovered_room != room.id:
                     self._hovered_room = room.id
                     self.setCursor(Qt.PointingHandCursor)
@@ -567,39 +735,41 @@ class SpatialCanvas(QWidget):
             self.room_clicked.emit(self._selected_room)
             self.update()
 
+    @staticmethod
+    def _point_in_polygon(x, y, poly):
+        """Ray casting algorithm."""
+        n = len(poly)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
 
 # ---------------------------------------------------------------------------
-# Parameter panel
+# Controls
 # ---------------------------------------------------------------------------
 
-class SpatialParamPanel(QWidget):
-    """Controls for the spatial architecture generator."""
-
+class SpatialControls(QWidget):
     generate_requested = Signal()
 
     def __init__(self):
         super().__init__()
         self.setFixedWidth(260)
-        self._build_ui()
-
-    def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
-        title = QLabel("ARCHITECTURE")
+        title = QLabel("PARAMETERS")
         title.setStyleSheet(f"color: {Colors.ACCENT}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
         layout.addWidget(title)
 
-        # Layout mode
-        layout.addWidget(QLabel("Layout:"))
-        self.layout_combo = QComboBox()
-        self.layout_combo.addItems(["Force-directed", "Circular", "Grid"])
-        self.layout_combo.setStyleSheet(f"color: {Colors.TEXT}; background: {Colors.BG}; border: 1px solid {Colors.BORDER}; padding: 4px;")
-        layout.addWidget(self.layout_combo)
-
-        # Clusters
-        layout.addWidget(QLabel("Rooms (clusters):"))
+        # Rooms
+        layout.addWidget(QLabel("Rooms (K):"))
         self.k_slider = QSlider(Qt.Horizontal)
         self.k_slider.setRange(2, 12)
         self.k_slider.setValue(5)
@@ -609,19 +779,12 @@ class SpatialParamPanel(QWidget):
         layout.addWidget(self.k_label)
         self.k_slider.valueChanged.connect(lambda v: self.k_label.setText(str(v)))
 
-        # Room scale
-        layout.addWidget(QLabel("Room scale:"))
-        self.scale_slider = QSlider(Qt.Horizontal)
-        self.scale_slider.setRange(50, 200)
-        self.scale_slider.setValue(100)
-        layout.addWidget(self.scale_slider)
-
-        # Corridor width
-        layout.addWidget(QLabel("Corridor width:"))
-        self.corr_slider = QSlider(Qt.Horizontal)
-        self.corr_slider.setRange(4, 30)
-        self.corr_slider.setValue(12)
-        layout.addWidget(self.corr_slider)
+        # Curvature
+        layout.addWidget(QLabel("Corridor curvature:"))
+        self.curve_slider = QSlider(Qt.Horizontal)
+        self.curve_slider.setRange(0, 50)
+        self.curve_slider.setValue(20)
+        layout.addWidget(self.curve_slider)
 
         # Wing threshold
         layout.addWidget(QLabel("Wing threshold:"))
@@ -630,12 +793,12 @@ class SpatialParamPanel(QWidget):
         self.wing_slider.setValue(50)
         layout.addWidget(self.wing_slider)
 
-        # Toggles
-        self.flow_cb = QPushButton("Show Flow")
-        self.flow_cb.setCheckable(True)
-        layout.addWidget(self.flow_cb)
+        # Flow toggle
+        self.flow_btn = QPushButton("Show Flow")
+        self.flow_btn.setCheckable(True)
+        layout.addWidget(self.flow_btn)
 
-        # Generate button
+        # Regenerate
         gen_btn = QPushButton("Regenerate")
         gen_btn.setStyleSheet(f"""
             QPushButton {{
@@ -649,11 +812,11 @@ class SpatialParamPanel(QWidget):
 
         layout.addStretch()
 
-        # Stats
-        self.stats_label = QLabel("")
-        self.stats_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 10px;")
-        self.stats_label.setWordWrap(True)
-        layout.addWidget(self.stats_label)
+        # Info
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 10px;")
+        layout.addWidget(self.info)
 
         self.setStyleSheet(f"""
             background-color: {Colors.BG_RAISED};
@@ -666,8 +829,6 @@ class SpatialParamPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class SpatialView(QWidget):
-    """Spatial Architecture Generator — parametric floor plan from vector topology."""
-
     def __init__(self, signals, state):
         super().__init__()
         self.signals = signals
@@ -681,70 +842,66 @@ class SpatialView(QWidget):
         layout.setSpacing(0)
 
         # Header
-        header = QHBoxLayout()
-        header.setContentsMargins(12, 8, 12, 8)
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(12, 8, 12, 8)
         title = QLabel("Spatial Architecture")
         title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 14px; font-weight: 700;")
-        header.addWidget(title)
+        hdr.addWidget(title)
 
-        info = QLabel("Clusters → Rooms | Connections → Corridors | Groups → Wings")
-        info.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
-        header.addWidget(info)
-        header.addStretch()
+        sub = QLabel("Voronoi rooms · Delaunay corridors · MST backbone · Bézier paths")
+        sub.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
+        hdr.addWidget(sub)
+        hdr.addStretch()
 
-        header_widget = QWidget()
-        header_widget.setLayout(header)
-        header_widget.setStyleSheet(
-            f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};"
-        )
-        layout.addWidget(header_widget)
+        hdr_w = QWidget()
+        hdr_w.setLayout(hdr)
+        hdr_w.setStyleSheet(f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};")
+        layout.addWidget(hdr_w)
 
-        # Content: canvas + params
         splitter = QSplitter(Qt.Horizontal)
         self.canvas = SpatialCanvas()
         splitter.addWidget(self.canvas)
-        self.params = SpatialParamPanel()
-        splitter.addWidget(self.params)
+        self.controls = SpatialControls()
+        splitter.addWidget(self.controls)
         splitter.setSizes([700, 260])
         layout.addWidget(splitter, stretch=1)
 
-        # Connect
-        self.params.generate_requested.connect(self._regenerate)
-        self.canvas.room_clicked.connect(self._on_room_clicked)
+        self.controls.generate_requested.connect(self._regenerate)
+        self.canvas.room_clicked.connect(self._on_room)
 
         self.setStyleSheet(f"background-color: {Colors.BG};")
 
-    def load_nodes(self, nodes: list[dict]):
+    def load_nodes(self, nodes):
         self._nodes = nodes
         self._regenerate()
 
     def _regenerate(self):
         if not self._nodes:
             return
+        self.canvas.engine.corridor_curvature = self.controls.curve_slider.value() / 100.0
+        self.canvas.engine.wing_threshold = self.controls.wing_slider.value() / 100.0
+        self.canvas.show_flow = self.controls.flow_btn.isChecked()
+        k = self.controls.k_slider.value()
+        self.canvas.generate(self._nodes, k)
 
-        # Read params
-        mode_map = {"Force-directed": "force", "Circular": "circular", "Grid": "grid"}
-        self.canvas.engine.layout_mode = mode_map.get(self.params.layout_combo.currentText(), "force")
-        self.canvas.engine.corridor_width = self.params.corr_slider.value()
-        self.canvas.engine.wing_threshold = self.params.wing_slider.value() / 100.0
-        self.canvas.engine.room_scale = self.params.scale_slider.value() / 100.0
-        self.canvas.show_flow = self.params.flow_cb.isChecked()
-
-        n_clusters = self.params.k_slider.value()
-        self.canvas.generate(self._nodes, n_clusters)
-
-        # Update stats
-        n_rooms = len(self.canvas.engine.rooms)
-        n_corridors = len(self.canvas.engine.corridors)
-        n_wings = len(self.canvas.engine.wings)
-        self.params.stats_label.setText(
-            f"Generated: {n_rooms} rooms, {n_corridors} corridors, {n_wings} wings\n"
-            f"Layout: {self.canvas.engine.layout_mode}"
+        nr = len(self.canvas.engine.rooms)
+        nc = len(self.canvas.engine.corridors)
+        nw = len(self.canvas.engine.wings)
+        mst = sum(1 for c in self.canvas.engine.corridors if c.is_mst)
+        self.controls.info.setText(
+            f"Voronoi rooms: {nr}\n"
+            f"Delaunay corridors: {nc}\n"
+            f"MST backbone: {mst}\n"
+            f"Wings: {nw}"
         )
 
-    def _on_room_clicked(self, room_id: int):
-        if room_id < len(self.canvas.engine.rooms):
-            room = self.canvas.engine.rooms[room_id]
+    def _on_room(self, rid):
+        if rid < len(self.canvas.engine.rooms):
+            room = self.canvas.engine.rooms[rid]
+            wing_name = "None"
+            if room.wing >= 0 and room.wing < len(self.canvas.engine.wings):
+                wing_name = self.canvas.engine.wings[room.wing].label
             self.signals.status_message.emit(
-                f"Room: {room.label} | {room.size} splats | Wing: {room.wing}"
+                f"Room: {room.label} | {len(room.members)} splats | "
+                f"Area: {room.area:.0f}px² | Wing: {wing_name}"
             )

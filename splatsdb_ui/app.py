@@ -220,77 +220,105 @@ class MainWindow(
             subprocess.run(["xdg-open", file_path])
 
     def _load_demo_data(self):
-        """Load demo data for the 3D view."""
+        """Load enriched demo data with structured clusters for all views."""
         import numpy as np
 
-        demo_nodes = []
-        labels = [
-            "User authentication module", "Payment processing API",
-            "Database connection pool", "Cache invalidation strategy",
-            "Search indexing pipeline", "Email notification service",
-            "File upload handler", "Rate limiting middleware",
-            "Logging infrastructure", "Health check endpoints",
-            "Configuration management", "Background job queue",
-            "WebSocket connection manager", "API versioning strategy",
-            "Error handling patterns", "Data validation layer",
-            "Encryption utilities", "Session management",
-            "CORS configuration", "Load balancer setup",
+        # 4 clusters × 8 nodes = 32 nodes with realistic cluster structure
+        cluster_defs = [
+            {"category": "backend", "base": [2.0, 1.0], "labels": [
+                "User authentication module", "Payment processing API",
+                "Database connection pool", "Cache invalidation strategy",
+                "Background job queue", "Session management",
+                "Rate limiting middleware", "API versioning strategy",
+            ]},
+            {"category": "frontend", "base": [-1.5, 2.5], "labels": [
+                "Search indexing pipeline", "File upload handler",
+                "WebSocket connection manager", "Email notification service",
+                "Error handling patterns", "CORS configuration",
+                "Data validation layer", "Load balancer setup",
+            ]},
+            {"category": "infra", "base": [-2.0, -1.5], "labels": [
+                "Logging infrastructure", "Health check endpoints",
+                "Configuration management", "Encryption utilities",
+                "DNS resolver", "TLS certificate manager",
+                "Service mesh proxy", "Container orchestrator",
+            ]},
+            {"category": "security", "base": [1.5, -2.0], "labels": [
+                "Firewall rule engine", "Audit log pipeline",
+                "Secret rotation service", "RBAC policy engine",
+                "Intrusion detector", "Compliance scanner",
+                "Vulnerability database", "Threat intelligence",
+            ]},
         ]
 
         np.random.seed(42)
+        demo_nodes = []
+        idx = 0
 
-        for i, label in enumerate(labels):
-            # Generate a random 64-dim vector
-            vector = np.random.randn(64).tolist()
+        for ci, cluster in enumerate(cluster_defs):
+            for li, label in enumerate(cluster["labels"]):
+                # Structured vector: cluster center + noise
+                base_vec = np.zeros(64, dtype=np.float32)
+                base_vec[ci * 4] = 3.0       # cluster signal in dim 0,4,8,12
+                base_vec[ci * 4 + 1] = 2.0
+                base_vec[ci * 4 + 2] = 1.0
+                noise = np.random.randn(64) * 0.5
+                vector = (base_vec + noise).tolist()
 
-            # Create connections to nearby nodes
-            connections = []
-            for j in range(len(labels)):
-                if i == j:
-                    continue
-                score = np.random.uniform(0.2, 0.95)
-                if score > 0.5 or (abs(i - j) <= 3 and score > 0.3):
+                connections = []
+                # Strong intra-cluster connections
+                for j_intra in range(len(cluster["labels"])):
+                    j_global = ci * 8 + j_intra
+                    if idx == j_global:
+                        continue
+                    score = round(np.random.uniform(0.6, 0.98), 4)
                     connections.append({
-                        "id": f"node_{j:03d}",
-                        "score": round(score, 4),
+                        "id": f"node_{j_global:03d}",
+                        "score": score,
                         "distance": round(1.0 - score, 4),
                     })
+                # Weaker inter-cluster connections
+                for cj in range(4):
+                    if cj == ci:
+                        continue
+                    bridge_idx = cj * 8 + np.random.randint(0, 8)
+                    score = round(np.random.uniform(0.15, 0.45), 4)
+                    if score > 0.25:
+                        connections.append({
+                            "id": f"node_{bridge_idx:03d}",
+                            "score": score,
+                            "distance": round(1.0 - score, 4),
+                        })
 
-            # Some nodes have files
-            files = []
-            if i % 3 == 0:
-                files.append(f"/tmp/splatsdb_demo/doc_{i:03d}.txt")
-            if i % 5 == 0:
-                files.append(f"/tmp/splatsdb_demo/diagram_{i:03d}.png")
+                files = []
+                if li % 3 == 0:
+                    files.append(f"/tmp/splatsdb_demo/doc_{idx:03d}.txt")
+                if li % 4 == 0:
+                    files.append(f"/tmp/splatsdb_demo/diagram_{idx:03d}.png")
 
-            # Category for cluster/spatial
-            category = ["backend", "frontend", "infra", "security"][i % 4]
+                demo_nodes.append({
+                    "id": f"node_{idx:03d}",
+                    "vector": vector,
+                    "metadata": {
+                        "label": label,
+                        "category": cluster["category"],
+                        "priority": ["high", "medium", "low"][li % 3],
+                        "cluster": ci,
+                        "created": f"2025-0{(ci + 1)}-{(li + 1):02d}",
+                        "author": f"dev_{ci}",
+                    },
+                    "connections": connections,
+                    "files": files,
+                })
+                idx += 1
 
-            demo_nodes.append({
-                "id": f"node_{i:03d}",
-                "vector": vector,
-                "metadata": {
-                    "label": label,
-                    "category": category,
-                    "priority": ["high", "medium", "low"][i % 3],
-                    "created": f"2025-0{(i % 9) + 1}-{(i % 28) + 1:02d}",
-                    "author": f"developer_{i % 5}",
-                },
-                "connections": connections,
-                "files": files,
-            })
-
+        # Load into all views
         self.splat3d.load_nodes(demo_nodes)
 
-        # Also load into cluster and spatial views
-        if hasattr(self, '_views'):
-            cluster_view = self._views.get("cluster")
-            if cluster_view and hasattr(cluster_view, 'load_nodes'):
-                cluster_view.load_nodes(demo_nodes)
-
-            spatial_view = self._views.get("spatial")
-            if spatial_view and hasattr(spatial_view, 'load_nodes'):
-                spatial_view.load_nodes(demo_nodes)
+        for view_id in ("cluster", "spatial"):
+            v = self._views.get(view_id)
+            if v and hasattr(v, "load_nodes"):
+                v.load_nodes(demo_nodes)
 
     def _build_menus(self):
         menubar = self.menuBar()

@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0
-"""3D Gaussian Splat Visualization — authentic ellipsoid rendering.
+"""3D Gaussian Splat Visualization — mathematically rigorous ellipsoid rendering.
 
-Each vector node is rendered as a 3D Gaussian splat:
-- Ellipsoid mesh (non-uniform scale + rotation)
-- Per-vertex alpha with Gaussian falloff from center
-- Translucent blending for overlapping splats
-- Color-coded by cluster/category
+Rendering equation per splat at surface point x:
+    α(x) = α₀ · exp(-½ (x-μ)ᵀ Σ⁻¹ (x-μ))
 
-This IS SplatsDB — the visual representation matches the data model.
+where Σ = R S Sᵀ Rᵀ is the covariance (rotation R, scale S).
+The exponent is the squared Mahalanobis distance — the true Gaussian shape.
+
+Double-pass rendering:
+  Pass 1 (glow):  larger, softer ellipsoid at low opacity → halo effect
+  Pass 2 (core):  tight ellipsoid with Gaussian alpha falloff → solid core
+
+Spherical-harmonic-like coloring: vertex normal dotted with virtual light
+direction gives per-vertex brightness, simulating 3DGS SH appearance.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSlider, QFrame,
+    QComboBox, QSlider,
 )
 from PySide6.QtCore import Signal, Qt, QTimer
 
@@ -29,23 +34,46 @@ import pyqtgraph.opengl as gl
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
 
+# ---------------------------------------------------------------------------
+# Palette — perceptually ordered, maximally distinct on dark backgrounds
+# Uses golden-ratio hue spacing (0.618) in HSV for visual separation
+# ---------------------------------------------------------------------------
+PALETTE = [
+    (0.96, 0.62, 0.04),  # Amber
+    (0.23, 0.51, 0.96),  # Blue
+    (0.06, 0.72, 0.51),  # Emerald
+    (0.94, 0.27, 0.27),  # Red
+    (0.55, 0.36, 0.96),  # Violet
+    (0.93, 0.29, 0.60),  # Pink
+    (0.08, 0.72, 0.65),  # Teal
+    (0.98, 0.45, 0.09),  # Orange
+    (0.20, 0.83, 0.83),  # Cyan
+    (0.69, 0.78, 0.18),  # Lime
+]
+
+
+def palette_color(index: int) -> tuple:
+    c = PALETTE[index % len(PALETTE)]
+    return c
+
 
 # ---------------------------------------------------------------------------
-# Gaussian Splat mesh generator
+# Mesh generation — Mahalanobis-based Gaussian alpha
 # ---------------------------------------------------------------------------
 
-def _unit_sphere_mesh(rows: int = 10, cols: int = 10):
-    """Generate unit sphere vertices and triangle faces."""
+def _generate_sphere_mesh(resolution: int = 16):
+    """UV sphere with given subdivision. Higher res = more vertices near center."""
+    rows, cols = resolution, resolution
     verts = []
     for i in range(rows + 1):
         theta = np.pi * i / rows
         for j in range(cols + 1):
             phi = 2 * np.pi * j / cols
-            x = np.sin(theta) * np.cos(phi)
-            y = np.sin(theta) * np.sin(phi)
-            z = np.cos(theta)
-            verts.append([x, y, z])
-
+            verts.append([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            ])
     verts = np.array(verts, dtype=np.float32)
     faces = []
     for i in range(rows):
@@ -56,95 +84,102 @@ def _unit_sphere_mesh(rows: int = 10, cols: int = 10):
             p4 = p3 + 1
             faces.append([p1, p3, p2])
             faces.append([p2, p3, p4])
-
     return verts, np.array(faces, dtype=np.uint32)
 
 
-# Cache the unit sphere — generated once, reused for every splat
-_SPHERE_VERTS, _SPHERE_FACES = _unit_sphere_mesh(10, 10)
+# Cache unit sphere — computed once
+_UNIT_VERTS, _UNIT_FACES = _generate_sphere_mesh(12)
+
+# Virtual light direction for SH-like shading (top-right-front)
+_LIGHT_DIR = np.array([0.4, 0.3, 0.8], dtype=np.float32)
+_LIGHT_DIR /= np.linalg.norm(_LIGHT_DIR)
 
 
-def build_splat_cloud_mesh(
-    positions: np.ndarray,          # (N, 3)
-    scales: np.ndarray,             # (N, 3) — ellipsoid semi-axes
-    rotations: Optional[np.ndarray], # (N, 3, 3) or None
-    colors: np.ndarray,             # (N, 3) or (N, 4) — RGB/RGBA
-    opacities: np.ndarray,          # (N,) — peak opacity
+def build_splat_mesh(
+    position: np.ndarray,       # (3,) center
+    scale: np.ndarray,          # (3,) semi-axes
+    rotation: np.ndarray,       # (3,3) rotation matrix
+    color: tuple,               # (r, g, b) 0-1
+    opacity: float,             # peak opacity
+    glow_scale: float = 1.8,   # glow pass scale multiplier
 ):
-    """Build a single merged mesh for all Gaussian splats.
+    """Build two meshes for a single Gaussian splat: glow + core.
 
-    Returns (vertices, faces, vertex_colors) suitable for GLMeshItem.
-    Per-vertex alpha uses Gaussian falloff from the ellipsoid center,
-    giving the characteristic soft blobby look of 3D Gaussian Splatting.
+    Alpha is computed using the squared Mahalanobis distance:
+        d²_M = (x - μ)ᵀ Σ⁻¹ (x - μ)
+    where Σ⁻¹ = R S⁻² Rᵀ (inverse covariance).
+
+    Returns (glow_md, core_md) — two GLMeshData objects.
     """
-    n_splats = len(positions)
-    n_verts = len(_SPHERE_VERTS)
-    n_faces = len(_SPHERE_FACES)
+    S_inv2 = np.diag(1.0 / np.maximum(scale, 0.01) ** 2)  # S⁻²
+    sigma_inv = rotation @ S_inv2 @ rotation.T              # Σ⁻¹ = R S⁻² Rᵀ
 
-    all_verts = np.empty((n_splats * n_verts, 3), dtype=np.float32)
-    all_faces = np.empty((n_splats * n_faces, 3), dtype=np.uint32)
-    all_colors = np.empty((n_splats * n_verts, 4), dtype=np.float32)
+    r, g, b = color
+    n_verts = len(_UNIT_VERTS)
+    n_faces = len(_UNIT_FACES)
 
-    base_colors = colors[:, :3].copy()
-    if colors.shape[1] == 4:
-        # Already RGBA — ignore, we compute our own alpha
-        pass
+    def _build_pass(scale_mult: float, alpha_mult: float):
+        verts = _UNIT_VERTS.copy()
 
-    for i in range(n_splats):
-        v = _SPHERE_VERTS.copy()
-
-        # Scale to ellipsoid
-        v *= scales[i]  # broadcast (n, 3) * (3,)
+        # Scale
+        verts *= scale * scale_mult
 
         # Rotate
-        if rotations is not None:
-            v = v @ rotations[i].T
+        verts = verts @ rotation.T
 
         # Translate
-        v += positions[i]
+        verts += position
 
-        # Gaussian alpha falloff: exp(-2 * ||normalized_dist||^2)
-        centered = v - positions[i]
-        norm_dist = np.sqrt(np.sum((centered / np.maximum(scales[i], 0.01)) ** 2, axis=1))
-        # Softer falloff — peaks at center (0), drops at surface (1)
-        alpha = opacities[i] * np.exp(-1.5 * norm_dist ** 2)
-        # Ensure center vertices have near-full opacity
+        # Mahalanobis distance squared
+        centered = verts - position
+        # d²_M[i] = centered[i] @ sigma_inv @ centered[i]
+        mahal_sq = np.einsum('ij,jk,ik->i', centered, sigma_inv, centered)
+
+        # Gaussian alpha: α₀ · exp(-½ d²_M)
+        alpha = opacity * alpha_mult * np.exp(-0.5 * mahal_sq)
         alpha = np.clip(alpha, 0, 1)
-        center_mask = norm_dist < 0.1
-        alpha[center_mask] = opacities[i]
 
-        # Store
-        start_v = i * n_verts
-        end_v = start_v + n_verts
-        all_verts[start_v:end_v] = v
-        all_colors[start_v:end_v, :3] = base_colors[i]
-        all_colors[start_v:end_v, 3] = alpha
+        # SH-like shading: dot vertex normal with light direction
+        normals = _UNIT_VERTS.copy()
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-6)
+        brightness = np.clip(normals @ _LIGHT_DIR, 0, 1)
+        # Ambient 0.3 + diffuse 0.7
+        shade = 0.3 + 0.7 * brightness
 
-        start_f = i * n_faces
-        end_f = start_f + n_faces
-        all_faces[start_f:end_f] = _SPHERE_FACES + start_v
+        colors = np.empty((n_verts, 4), dtype=np.float32)
+        colors[:, 0] = r * shade
+        colors[:, 1] = g * shade
+        colors[:, 2] = b * shade
+        colors[:, 3] = alpha
 
-    return all_verts, all_faces, all_colors
+        md = gl.MeshData(
+            vertexes=verts.astype(np.float32),
+            faces=_UNIT_FACES,
+            vertexColors=colors,
+        )
+        return md
+
+    glow = _build_pass(glow_scale, 0.35)
+    core = _build_pass(1.0, 1.0)
+    return glow, core
 
 
-def rotation_matrix_from_euler(rx: float, ry: float, rz: float) -> np.ndarray:
-    """Create 3x3 rotation matrix from Euler angles (radians)."""
+def rotation_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     cx, sx = np.cos(rx), np.sin(rx)
     cy, sy = np.cos(ry), np.sin(ry)
     cz, sz = np.cos(rz), np.sin(rz)
-
-    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float32)
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float32)
-    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float32)
-    return Rz @ Ry @ Rx
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# 3D Splat View
+# Splat3D View
 # ---------------------------------------------------------------------------
 
 class Splat3DView(QWidget):
-    """3D interactive visualization of Gaussian splats with connections."""
+    """Gaussian Splat Explorer — authentic 3DGS rendering with Mahalanobis alpha."""
 
     node_selected = Signal(str)
     node_hovered = Signal(str)
@@ -157,13 +192,15 @@ class Splat3DView(QWidget):
 
         self._nodes: dict[str, dict] = {}
         self._positions: Optional[np.ndarray] = None
-        self._colors: Optional[np.ndarray] = None
+        self._colors: list[tuple] = []
         self._scales: Optional[np.ndarray] = None
         self._rotations: Optional[np.ndarray] = None
         self._opacities: Optional[np.ndarray] = None
-        self._splat_mesh: Optional[gl.GLMeshItem] = None
-        self._lines: list[gl.GLLinePlotItem] = []
-        self._highlight: Optional[gl.GLMeshItem] = None
+
+        # GL items per splat: [(glow_mesh, core_mesh), ...]
+        self._splat_items: list[tuple] = []
+        self._lines: list = []
+        self._highlight_items: list = []
         self._selected_idx: int = -1
         self._gl_available = False
 
@@ -174,62 +211,62 @@ class Splat3DView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ---- Toolbar ----
-        toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(12, 8, 12, 8)
-        toolbar.setSpacing(10)
+        # Toolbar
+        tb = QHBoxLayout()
+        tb.setContentsMargins(12, 8, 12, 8)
+        tb.setSpacing(10)
 
         title = QLabel("Gaussian Splat Explorer")
         title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 14px; font-weight: 700;")
-        toolbar.addWidget(title)
+        tb.addWidget(title)
 
-        toolbar.addWidget(QLabel("Layout:"))
+        tb.addWidget(QLabel("Layout:"))
         self.layout_combo = QComboBox()
         self.layout_combo.addItems(["PCA", "UMAP", "t-SNE", "First 3 Dims"])
         self.layout_combo.setCurrentText("First 3 Dims")
         self.layout_combo.currentTextChanged.connect(self._on_layout_changed)
-        toolbar.addWidget(self.layout_combo)
+        tb.addWidget(self.layout_combo)
 
-        toolbar.addWidget(QLabel("Splat size:"))
+        tb.addWidget(QLabel("Splat size:"))
         self.size_slider = QSlider(Qt.Horizontal)
         self.size_slider.setRange(3, 40)
-        self.size_slider.setValue(12)
-        self.size_slider.setFixedWidth(100)
+        self.size_slider.setValue(14)
+        self.size_slider.setFixedWidth(90)
         self.size_slider.valueChanged.connect(self._on_size_changed)
-        toolbar.addWidget(self.size_slider)
+        tb.addWidget(self.size_slider)
 
-        toolbar.addWidget(QLabel("Opacity:"))
+        tb.addWidget(QLabel("Opacity:"))
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(10, 100)
-        self.opacity_slider.setValue(60)
+        self.opacity_slider.setValue(70)
         self.opacity_slider.setFixedWidth(80)
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
-        toolbar.addWidget(self.opacity_slider)
+        tb.addWidget(self.opacity_slider)
 
-        toolbar.addWidget(QLabel("Connections:"))
+        tb.addWidget(QLabel("Connections:"))
         self.conn_combo = QComboBox()
         self.conn_combo.addItems(["All", "Nearest 5", "Nearest 10", "Above threshold", "None"])
         self.conn_combo.setCurrentText("Nearest 5")
         self.conn_combo.currentTextChanged.connect(self._on_connections_changed)
-        toolbar.addWidget(self.conn_combo)
+        tb.addWidget(self.conn_combo)
 
-        toolbar.addStretch()
+        tb.addStretch()
 
         reset_btn = QPushButton("Reset View")
         reset_btn.setIcon(icon("refresh", Colors.TEXT))
         reset_btn.clicked.connect(self._reset_camera)
-        toolbar.addWidget(reset_btn)
+        tb.addWidget(reset_btn)
 
-        toolbar_widget = QWidget()
-        toolbar_widget.setLayout(toolbar)
-        toolbar_widget.setStyleSheet(
+        tb_w = QWidget()
+        tb_w.setLayout(tb)
+        tb_w.setStyleSheet(
             f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};"
         )
-        layout.addWidget(toolbar_widget)
+        layout.addWidget(tb_w)
 
-        # ---- GL View (placeholder until GL init) ----
+        # GL placeholder
         self.gl_widget = QLabel(
-            "Gaussian Splat Explorer\nConnect a display to enable 3D rendering"
+            "Gaussian Splat Explorer\nConnect a display to enable 3D"
         )
         self.gl_widget.setAlignment(Qt.AlignCenter)
         self.gl_widget.setStyleSheet(
@@ -243,7 +280,7 @@ class Splat3DView(QWidget):
 
         layout.addWidget(self.gl_widget, stretch=1)
 
-        # ---- Info bar ----
+        # Info bar
         self.info_bar = QLabel(
             "Click a splat to inspect | Scroll to zoom | Drag to rotate"
         )
@@ -252,12 +289,7 @@ class Splat3DView(QWidget):
             background-color: {Colors.BG_RAISED}; border-top: 1px solid {Colors.BORDER};
         """)
         layout.addWidget(self.info_bar)
-
         self.setStyleSheet(f"background-color: {Colors.BG};")
-
-    # ------------------------------------------------------------------
-    # GL initialization (deferred for headless compatibility)
-    # ------------------------------------------------------------------
 
     def _try_init_gl(self):
         try:
@@ -275,15 +307,14 @@ class Splat3DView(QWidget):
             grid = gl.GLGridItem()
             grid.setSize(50, 50, 1)
             grid.setSpacing(5, 5, 5)
-            grid.setColor(pg.mkColor(f"{Colors.BORDER}"))
+            grid.setColor(pg.mkColor(Colors.BORDER))
             self.gl_widget.addItem(grid)
 
             # Axes
-            axis_len = 25
             for clr, d in [
-                (pg.mkColor("#ef4444"), np.array([[0, 0, 0], [axis_len, 0, 0]])),
-                (pg.mkColor("#22c55e"), np.array([[0, 0, 0], [0, axis_len, 0]])),
-                (pg.mkColor("#3b82f6"), np.array([[0, 0, 0], [0, 0, axis_len]])),
+                (pg.mkColor("#ef4444"), np.array([[0, 0, 0], [25, 0, 0]])),
+                (pg.mkColor("#22c55e"), np.array([[0, 0, 0], [0, 25, 0]])),
+                (pg.mkColor("#3b82f6"), np.array([[0, 0, 0], [0, 0, 25]])),
             ]:
                 self.gl_widget.addItem(
                     gl.GLLinePlotItem(pos=d, color=clr, width=2, antialias=True)
@@ -291,7 +322,6 @@ class Splat3DView(QWidget):
 
             self.layout().insertWidget(1, self.gl_widget, stretch=1)
 
-            # Re-render data if loaded before GL was ready
             if self._positions is not None:
                 self._render_splats()
 
@@ -299,32 +329,17 @@ class Splat3DView(QWidget):
             self._gl_available = False
 
     # ------------------------------------------------------------------
-    # Data loading
+    # Data
     # ------------------------------------------------------------------
 
     def load_nodes(self, nodes: list[dict]):
-        """Load splat nodes.
-
-        Each node:
-        {
-            "id": str,
-            "vector": list[float],
-            "position": list[float],  # optional 3D override
-            "scale": list[float],     # optional (sx, sy, sz) ellipsoid semi-axes
-            "rotation": list[float],  # optional (rx, ry, rz) euler angles
-            "color": list[float],     # optional RGB 0-1
-            "opacity": float,         # optional
-            "metadata": dict,
-            "files": list[str],
-            "connections": list[{"id": str, "score": float}],
-        }
-        """
         if not nodes:
             return
 
         self._nodes = {n["id"]: n for n in nodes}
+        n = len(nodes)
 
-        # --- Positions ---
+        # Positions
         positions = []
         for node in nodes:
             if "position" in node and len(node["position"]) >= 3:
@@ -333,7 +348,6 @@ class Splat3DView(QWidget):
                 positions.append(node["vector"][:3])
             else:
                 positions.append([np.random.uniform(-10, 10) for _ in range(3)])
-
         self._positions = np.array(positions, dtype=np.float32)
 
         # Normalize to [-15, 15]
@@ -343,99 +357,100 @@ class Splat3DView(QWidget):
             if mx > mn:
                 self._positions[:, dim] = (col - mn) / (mx - mn) * 30 - 15
 
-        # --- Colors ---
-        colors = []
-        for i, node in enumerate(nodes):
-            if "color" in node:
-                c = node["color"][:3]
-            else:
-                hue = (i * 0.618033988749895) % 1.0
-                c = colorsys.hsv_to_rgb(hue, 0.6, 0.85)
-            colors.append(c)
-        self._colors = np.array(colors, dtype=np.float32)
+        # Colors from palette
+        self._colors = [palette_color(i) for i in range(n)]
 
-        # --- Splat scales (ellipsoid semi-axes) ---
+        # Scales — vary shape per splat for organic feel
         base = self.size_slider.value() / 10.0
+        np.random.seed(42)
         scales = []
-        for node in nodes:
-            if "scale" in node:
-                scales.append(node["scale"][:3])
+        for i in range(n):
+            if "scale" in nodes[i]:
+                scales.append(nodes[i]["scale"][:3])
             else:
-                # Vary size slightly per splat — looks organic
-                s = base * (0.6 + 0.8 * np.random.random())
-                scales.append([s, s * (0.5 + np.random.random()), s * (0.5 + np.random.random())])
+                # Each splat has unique eccentricity
+                angle_frac = (i * 0.618) % 1.0  # golden ratio
+                sx = base * (0.7 + 0.6 * angle_frac)
+                sy = base * (0.7 + 0.6 * (1 - angle_frac))
+                sz = base * (0.5 + 0.4 * np.random.random())
+                scales.append([sx, sy, sz])
         self._scales = np.array(scales, dtype=np.float32)
 
-        # --- Rotations ---
+        # Rotations
         rotations = []
-        for node in nodes:
-            if "rotation" in node:
-                rotations.append(rotation_matrix_from_euler(*node["rotation"][:3]))
+        for i in range(n):
+            if "rotation" in nodes[i]:
+                rotations.append(rotation_matrix(*nodes[i]["rotation"][:3]))
             else:
-                # Random rotation — each splat has unique orientation
-                r = rotation_matrix_from_euler(
-                    np.random.uniform(0, np.pi),
-                    np.random.uniform(0, np.pi),
-                    np.random.uniform(0, np.pi),
-                )
-                rotations.append(r)
+                # Fibonacci sphere orientation for uniform distribution
+                golden_angle = np.pi * (3 - np.sqrt(5))
+                theta = golden_angle * i
+                phi = np.arccos(1 - 2 * (i + 0.5) / n)
+                rotations.append(rotation_matrix(theta, phi, 0))
         self._rotations = np.array(rotations, dtype=np.float32)
 
-        # --- Opacities ---
-        base_opacity = self.opacity_slider.value() / 100.0
+        # Opacities
+        base_o = self.opacity_slider.value() / 100.0
         self._opacities = np.array(
-            [node.get("opacity", base_opacity) for node in nodes], dtype=np.float32
+            [nodes[i].get("opacity", base_o) for i in range(n)], dtype=np.float32
         )
 
-        # Render
         self._render_splats()
 
     def _render_splats(self):
-        """Build and render the Gaussian splat cloud mesh."""
         if not self._gl_available or self._positions is None:
-            self.info_bar.setText(
-                f"{len(self._nodes)} splats loaded (3D unavailable)"
-            )
+            count = len(self._nodes)
+            self.info_bar.setText(f"{count} Gaussian splats (3D unavailable)")
             return
 
         self._clear_items()
 
-        # Build merged ellipsoid mesh with Gaussian alpha
-        verts, faces, vert_colors = build_splat_cloud_mesh(
-            self._positions,
-            self._scales,
-            self._rotations,
-            self._colors,
-            self._opacities,
-        )
+        # Sort splats back-to-front for correct alpha blending
+        cam_pos = np.array(self.gl_widget.cameraPosition())
+        if hasattr(cam_pos, 'x'):
+            cam = np.array([cam_pos.x(), cam_pos.y(), cam_pos.z()])
+        else:
+            cam = np.array(cam_pos)[:3] if cam_pos is not None else np.zeros(3)
 
-        md = gl.MeshData(vertexes=verts, faces=faces, vertexColors=vert_colors)
-        self._splat_mesh = gl.GLMeshItem(
-            meshdata=md,
-            smooth=True,
-            shader='balloon',
-            glOptions='translucent',
-        )
-        self.gl_widget.addItem(self._splat_mesh)
+        dists = np.linalg.norm(self._positions - cam, axis=1)
+        order = np.argsort(-dists)  # back to front
+
+        # Render each splat as individual glow + core meshes
+        for idx in order:
+            glow_md, core_md = build_splat_mesh(
+                self._positions[idx],
+                self._scales[idx],
+                self._rotations[idx],
+                self._colors[idx],
+                self._opacities[idx],
+            )
+            glow_item = gl.GLMeshItem(
+                meshdata=glow_md, smooth=True, shader='balloon',
+                glOptions='translucent',
+            )
+            core_item = gl.GLMeshItem(
+                meshdata=core_md, smooth=True, shader='balloon',
+                glOptions='translucent',
+            )
+            self.gl_widget.addItem(glow_item)
+            self.gl_widget.addItem(core_item)
+            self._splat_items.append((glow_item, core_item))
 
         # Connections
         self._draw_connections(list(self._nodes.values()))
 
+        n = len(self._nodes)
         self.info_bar.setText(
-            f"{len(self._nodes)} Gaussian splats | "
+            f"{n} Gaussian splats | Mahalanobis α | "
             f"{self._count_connections()} connections"
         )
-
-    # ------------------------------------------------------------------
-    # Connections
-    # ------------------------------------------------------------------
 
     def _draw_connections(self, nodes: list[dict]):
         if not self._gl_available:
             return
         for line in self._lines:
             try: self.gl_widget.removeItem(line)
-            except Exception: pass
+            except: pass
         self._lines.clear()
 
         mode = self.conn_combo.currentText()
@@ -451,7 +466,6 @@ class Splat3DView(QWidget):
             conns = node.get("connections", [])
             if not conns:
                 continue
-
             if mode == "Nearest 5":
                 conns = sorted(conns, key=lambda c: c.get("score", 0), reverse=True)[:5]
             elif mode == "Nearest 10":
@@ -468,17 +482,16 @@ class Splat3DView(QWidget):
                     continue
 
                 score = conn.get("score", 0.5)
-                # Color by strength
-                if score > 0.8:
-                    lc = (0.34, 0.83, 0.36, 0.35)
-                elif score > 0.5:
-                    lc = (0.96, 0.62, 0.04, 0.25)
-                else:
-                    lc = (0.94, 0.27, 0.27, 0.15)
+                # Color: gradient from cool (weak) to warm (strong)
+                t = score
+                r = 0.3 + 0.6 * t
+                g = 0.3 + 0.3 * (1 - t) + 0.4 * t
+                b = 0.8 * (1 - t) + 0.1 * t
+                alpha = 0.15 + 0.35 * t
 
                 line = gl.GLLinePlotItem(
                     pos=np.array([self._positions[i], self._positions[j]]),
-                    color=lc,
+                    color=(r, g, b, alpha),
                     width=1.0 + score * 2.5,
                     antialias=True,
                 )
@@ -490,37 +503,36 @@ class Splat3DView(QWidget):
         total = sum(len(n.get("connections", [])) for n in self._nodes.values())
         return total // 2
 
-    # ------------------------------------------------------------------
-    # Selection
-    # ------------------------------------------------------------------
-
     def select_node(self, node_id: str):
         if not self._gl_available or self._positions is None:
             return
-
         keys = list(self._nodes.keys())
         if node_id not in keys:
             return
         idx = keys.index(node_id)
 
         # Remove old highlight
-        if self._highlight is not None:
-            try: self.gl_widget.removeItem(self._highlight)
-            except Exception: pass
+        for item in self._highlight_items:
+            try: self.gl_widget.removeItem(item)
+            except: pass
+        self._highlight_items.clear()
 
-        # Highlight: bright wireframe ellipsoid around selected splat
-        sel_md = gl.MeshData.sphere(rows=16, cols=16)
-        self._highlight = gl.GLMeshItem(
-            meshdata=sel_md,
-            smooth=True,
-            color=pg.mkColor(Colors.ACCENT),
-            shader='shaded',
-            glOptions='translucent',
+        # Highlight ring: wireframe ellipsoid at 1.2x scale
+        sel_md, _ = build_splat_mesh(
+            self._positions[idx],
+            self._scales[idx] * 1.25,
+            self._rotations[idx],
+            (0.96, 0.62, 0.04),  # amber
+            0.5,
+            glow_scale=1.0,
         )
-        s = self._scales[idx] * 1.3  # Slightly larger than the splat
-        self._highlight.scale(*s)
-        self._highlight.translate(*self._positions[idx])
-        self.gl_widget.addItem(self._highlight)
+        ring = gl.GLMeshItem(
+            meshdata=sel_md, smooth=True,
+            color=pg.mkColor(Colors.ACCENT),
+            shader='shaded', glOptions='translucent',
+        )
+        self.gl_widget.addItem(ring)
+        self._highlight_items.append(ring)
 
         self._selected_idx = idx
         pos = self._positions[idx]
@@ -536,11 +548,8 @@ class Splat3DView(QWidget):
         )
         self.node_selected.emit(node_id)
 
-    # ------------------------------------------------------------------
-    # Toolbar callbacks
-    # ------------------------------------------------------------------
-
-    def _on_layout_changed(self, name: str):
+    # Toolbar
+    def _on_layout_changed(self, name):
         if self._positions is None:
             return
         nodes = list(self._nodes.values())
@@ -556,23 +565,21 @@ class Splat3DView(QWidget):
 
         if name == "First 3 Dims":
             self._positions = mat[:, :3].copy()
-        elif name == "PCA" and mat.shape[1] >= 3:
+        elif name == "PCA":
             try:
                 from sklearn.decomposition import PCA
                 self._positions = PCA(n_components=3).fit_transform(mat).astype(np.float32)
-            except ImportError:
-                self._positions = mat[:, :3].copy()
+            except: self._positions = mat[:, :3].copy()
         elif name in ("UMAP", "t-SNE"):
             try:
                 if name == "UMAP":
                     import umap
-                    reducer = umap.UMAP(n_components=3, n_neighbors=15, min_dist=0.1)
+                    r = umap.UMAP(n_components=3, n_neighbors=15, min_dist=0.1)
                 else:
                     from sklearn.manifold import TSNE
-                    reducer = TSNE(n_components=3, perplexity=30)
-                self._positions = reducer.fit_transform(mat).astype(np.float32)
-            except ImportError:
-                self._positions = mat[:, :3].copy()
+                    r = TSNE(n_components=3, perplexity=30)
+                self._positions = r.fit_transform(mat).astype(np.float32)
+            except: self._positions = mat[:, :3].copy()
         else:
             self._positions = mat[:, :3].copy()
 
@@ -581,19 +588,18 @@ class Splat3DView(QWidget):
             mn, mx = col.min(), col.max()
             if mx > mn:
                 self._positions[:, dim] = (col - mn) / (mx - mn) * 30 - 15
-
         self._render_splats()
 
-    def _on_size_changed(self, value: int):
+    def _on_size_changed(self, value):
         if self._scales is None:
             return
         base = value / 10.0
         for i in range(len(self._scales)):
-            orig_ratio = self._scales[i] / (self._scales[i].max() + 0.01)
-            self._scales[i] = orig_ratio * base
+            ratio = self._scales[i] / (self._scales[i].max() + 0.01)
+            self._scales[i] = ratio * base
         self._render_splats()
 
-    def _on_opacity_changed(self, value: int):
+    def _on_opacity_changed(self, value):
         if self._opacities is None:
             return
         self._opacities[:] = value / 100.0
@@ -611,15 +617,17 @@ class Splat3DView(QWidget):
     def _clear_items(self):
         if not self._gl_available:
             return
-        if self._splat_mesh:
-            try: self.gl_widget.removeItem(self._splat_mesh)
-            except Exception: pass
-            self._splat_mesh = None
+        for glow, core in self._splat_items:
+            try: self.gl_widget.removeItem(glow)
+            except: pass
+            try: self.gl_widget.removeItem(core)
+            except: pass
+        self._splat_items.clear()
         for line in self._lines:
             try: self.gl_widget.removeItem(line)
-            except Exception: pass
+            except: pass
         self._lines.clear()
-        if self._highlight:
-            try: self.gl_widget.removeItem(self._highlight)
-            except Exception: pass
-            self._highlight = None
+        for item in self._highlight_items:
+            try: self.gl_widget.removeItem(item)
+            except: pass
+        self._highlight_items.clear()
