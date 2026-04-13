@@ -263,12 +263,15 @@ class MainWindow(
             if i % 5 == 0:
                 files.append(f"/tmp/splatsdb_demo/diagram_{i:03d}.png")
 
+            # Category for cluster/spatial
+            category = ["backend", "frontend", "infra", "security"][i % 4]
+
             demo_nodes.append({
                 "id": f"node_{i:03d}",
                 "vector": vector,
                 "metadata": {
                     "label": label,
-                    "category": ["backend", "frontend", "infra", "security"][i % 4],
+                    "category": category,
                     "priority": ["high", "medium", "low"][i % 3],
                     "created": f"2025-0{(i % 9) + 1}-{(i % 28) + 1:02d}",
                     "author": f"developer_{i % 5}",
@@ -278,6 +281,16 @@ class MainWindow(
             })
 
         self.splat3d.load_nodes(demo_nodes)
+
+        # Also load into cluster and spatial views
+        if hasattr(self, '_views'):
+            cluster_view = self._views.get("cluster")
+            if cluster_view and hasattr(cluster_view, 'load_nodes'):
+                cluster_view.load_nodes(demo_nodes)
+
+            spatial_view = self._views.get("spatial")
+            if spatial_view and hasattr(spatial_view, 'load_nodes'):
+                spatial_view.load_nodes(demo_nodes)
 
     def _build_menus(self):
         menubar = self.menuBar()
