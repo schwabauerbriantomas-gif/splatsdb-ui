@@ -1,36 +1,33 @@
 # SPDX-License-Identifier: GPL-3.0
-"""HTTP API client for SplatsDB backend."""
+"""HTTP API client for SplatsDB backend.
+
+Mirrors the Rust API exactly:
+  GET  /health           → HealthResponse
+  POST /status           → StatusResponse
+  POST /store            → StoreResponse
+  POST /search           → SearchResponse
+
+Plus optimization stats:
+  GET  /optimization     → OptimizationMetrics + GpuConfig + CacheStats
+"""
 
 from __future__ import annotations
 
-import json
-from typing import Optional
 from dataclasses import dataclass, field
+from typing import Optional
 
 import httpx
 
 
 @dataclass
-class SearchResult:
-    """A single search result from SplatsDB."""
-    index: int
-    score: float
-    text: str = ""
-    metadata: str = ""
-    document_id: str = ""
-    category: str = ""
+class HealthResponse:
+    status: str = ""
+    version: str = ""
 
 
 @dataclass
-class StoreResult:
-    """Result of storing a document."""
-    id: str
-    status: str
-
-
-@dataclass
-class BackendStatus:
-    """Backend server status."""
+class StatusResponse:
+    """Full backend status — mirrors Rust StatusResponse."""
     n_active: int = 0
     max_splats: int = 0
     dimension: int = 0
@@ -40,14 +37,67 @@ class BackendStatus:
     has_semantic_memory: bool = False
 
 
-class SplatsDBClient:
-    """Async HTTP client for the SplatsDB Axum backend.
+@dataclass
+class StoreRequest:
+    text: str
+    category: Optional[str] = None
+    id: Optional[str] = None
+    embedding: Optional[list[float]] = None
 
-    Endpoints:
-        POST /store   — Store a memory (text + optional metadata)
-        POST /search  — Search memories (query text, top-k)
-        POST /status  — Get store stats
-        GET  /health  — Health check
+
+@dataclass
+class StoreResponse:
+    id: str = ""
+    status: str = ""
+
+
+@dataclass
+class SearchResult:
+    """A single search result."""
+    index: int = 0
+    score: float = 0.0
+    metadata: Optional[str] = None
+    text: str = ""
+
+
+@dataclass
+class SearchResponse:
+    results: list[SearchResult] = field(default_factory=list)
+
+
+@dataclass
+class OptimizationMetrics:
+    total_queries: int = 0
+    total_adds: int = 0
+    gpu_queries: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+
+@dataclass
+class GpuConfig:
+    device_name: str = ""
+    vram_mb: int = 0
+    optimal_batch_size: int = 0
+    compute_units: int = 0
+
+
+@dataclass
+class CacheStats:
+    enabled: bool = False
+    hits: int = 0
+    misses: int = 0
+    size: int = 0
+
+
+class SplatsDBClient:
+    """HTTP client for SplatsDB Axum backend.
+
+    Endpoint mapping (Rust api_server.rs):
+        GET  /health          → HealthResponse
+        POST /status          → StatusResponse
+        POST /store           → StoreResponse   (body: StoreRequest)
+        POST /search          → SearchResponse  (body: SearchRequest)
     """
 
     def __init__(self, base_url: str = "http://127.0.0.1:8199", api_key: str = ""):
@@ -72,22 +122,38 @@ class SplatsDBClient:
         if self._client and not self._client.is_closed:
             self._client.close()
 
-    # ── Health / Status ─────────────────────────────────────────────
+    # ── Health ─────────────────────────────────────────────────────
 
-    def health(self) -> dict:
-        """Check backend health."""
+    def health(self) -> HealthResponse:
         r = self.client.get("/health")
         r.raise_for_status()
-        return r.json()
+        d = r.json()
+        return HealthResponse(status=d.get("status", ""), version=d.get("version", ""))
 
-    def status(self) -> BackendStatus:
-        """Get store status."""
+    def is_connected(self) -> bool:
+        try:
+            self.health()
+            return True
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return False
+
+    # ── Status ─────────────────────────────────────────────────────
+
+    def status(self) -> StatusResponse:
         r = self.client.post("/status")
         r.raise_for_status()
-        data = r.json()
-        return BackendStatus(**data)
+        d = r.json()
+        return StatusResponse(
+            n_active=d.get("n_active", 0),
+            max_splats=d.get("max_splats", 0),
+            dimension=d.get("dimension", 0),
+            has_hnsw=d.get("has_hnsw", False),
+            has_lsh=d.get("has_lsh", False),
+            has_quantization=d.get("has_quantization", False),
+            has_semantic_memory=d.get("has_semantic_memory", False),
+        )
 
-    # ── Store ───────────────────────────────────────────────────────
+    # ── Store ──────────────────────────────────────────────────────
 
     def store(
         self,
@@ -95,9 +161,8 @@ class SplatsDBClient:
         category: Optional[str] = None,
         doc_id: Optional[str] = None,
         embedding: Optional[list[float]] = None,
-    ) -> StoreResult:
-        """Store a document in SplatsDB."""
-        payload: dict = {"text": text}
+    ) -> StoreResponse:
+        payload = {"text": text}
         if category:
             payload["category"] = category
         if doc_id:
@@ -107,47 +172,68 @@ class SplatsDBClient:
 
         r = self.client.post("/store", json=payload)
         r.raise_for_status()
-        data = r.json()
-        return StoreResult(id=data["id"], status=data["status"])
+        d = r.json()
+        return StoreResponse(id=d.get("id", ""), status=d.get("status", ""))
 
-    def store_batch(self, documents: list[dict]) -> list[StoreResult]:
-        """Store multiple documents."""
-        results = []
-        for doc in documents:
-            results.append(self.store(**doc))
-        return results
+    def store_batch(self, documents: list[StoreRequest]) -> list[StoreResponse]:
+        return [self.store(
+            text=d.text,
+            category=d.category,
+            doc_id=d.id,
+            embedding=d.embedding,
+        ) for d in documents]
 
-    # ── Search ──────────────────────────────────────────────────────
+    # ── Search ─────────────────────────────────────────────────────
 
     def search(
         self,
         query: str,
         top_k: int = 10,
         embedding: Optional[list[float]] = None,
-    ) -> list[SearchResult]:
-        """Search for similar documents."""
-        payload: dict = {"query": query, "top_k": top_k}
+    ) -> SearchResponse:
+        payload = {"query": query, "top_k": top_k}
         if embedding:
             payload["embedding"] = embedding
 
         r = self.client.post("/search", json=payload)
         r.raise_for_status()
-        data = r.json()
-        return [
-            SearchResult(
+        d = r.json()
+        results = []
+        for item in d.get("results", []):
+            results.append(SearchResult(
                 index=item.get("index", 0),
                 score=item.get("score", 0.0),
-                metadata=item.get("metadata", ""),
-            )
-            for item in data.get("results", [])
-        ]
+                metadata=item.get("metadata"),
+            ))
+        return SearchResponse(results=results)
 
-    # ── Convenience ─────────────────────────────────────────────────
+    # ── Optimization stats (from optimized_api.rs) ─────────────────
 
-    def is_connected(self) -> bool:
-        """Check if backend is reachable."""
+    def optimization_stats(self) -> dict:
+        """Get optimization metrics (cache, GPU, query stats)."""
         try:
-            self.health()
+            r = self.client.get("/optimization")
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPStatusError, httpx.ConnectError):
+            return {}
+
+    # ── Prefetch suggestions ───────────────────────────────────────
+
+    def prefetch_suggestions(self, n: int = 10) -> list[str]:
+        try:
+            r = self.client.get(f"/prefetch?n={n}")
+            r.raise_for_status()
+            return r.json().get("suggestions", [])
+        except (httpx.HTTPStatusError, httpx.ConnectError):
+            return []
+
+    # ── Cache management ───────────────────────────────────────────
+
+    def clear_cache(self) -> bool:
+        try:
+            r = self.client.post("/cache/clear")
+            r.raise_for_status()
             return True
-        except (httpx.ConnectError, httpx.TimeoutException):
+        except (httpx.HTTPStatusError, httpx.ConnectError):
             return False
