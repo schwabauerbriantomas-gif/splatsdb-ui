@@ -15,7 +15,7 @@ def run():
     from PySide6.QtGui import QIcon
 
     from splatsdb_ui import __app_name__
-    from splatsdb_ui.app import SplatsDBApp
+    from splatsdb_ui.app import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
@@ -24,9 +24,9 @@ def run():
 
     # Load dark theme
     from splatsdb_ui.utils.theme import load_theme
-    load_theme(app)
+    load_theme()
 
-    window = SplatsDBApp()
+    window = MainWindow()
     window.show()
 
     sys.exit(app.exec())

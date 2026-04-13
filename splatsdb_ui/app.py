@@ -315,7 +315,7 @@ class MainWindow(
         # Load into all views
         self.splat3d.load_nodes(demo_nodes)
 
-        for view_id in ("cluster", "spatial"):
+        for view_id in ("cluster", "spatial", "graph"):
             v = self._views.get(view_id)
             if v and hasattr(v, "load_nodes"):
                 v.load_nodes(demo_nodes)
