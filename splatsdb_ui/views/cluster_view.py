@@ -4,18 +4,16 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
-    QLineEdit, QComboBox, QProgressBar,
+    QFormLayout, QLineEdit,
 )
 from PySide6.QtCore import Qt
-
-from splatsdb_ui.utils.signals import SignalBus
-from splatsdb_ui.utils.state import AppState
+from PySide6.QtGui import QColor
+from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import CLUSTER, REFRESH, ADD, REMOVE
 
 
 class ClusterView(QWidget):
-    """Cluster dashboard — nodes, routing, sharding, benchmarks."""
-
-    def __init__(self, signals: SignalBus, state: AppState):
+    def __init__(self, signals, state):
         super().__init__()
         self.signals = signals
         self.state = state
@@ -23,86 +21,56 @@ class ClusterView(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
 
-        # Header
         header = QHBoxLayout()
-        title = QLabel("Cluster Dashboard")
-        title.setProperty("class", "title")
+        title = QLabel("Cluster")
+        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 18px; font-weight: 700;")
         header.addWidget(title)
         header.addStretch()
 
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.clicked.connect(self._on_refresh)
+        refresh_btn = QPushButton(f"{REFRESH}")
+        refresh_btn.setFixedSize(32, 32)
         header.addWidget(refresh_btn)
-
-        reset_btn = QPushButton("🗑️ Reset")
-        reset_btn.setProperty("class", "danger")
-        reset_btn.clicked.connect(self._on_reset)
-        header.addWidget(reset_btn)
-
+        add_btn = QPushButton(f"{ADD} Node")
+        add_btn.setProperty("class", "primary")
+        header.addWidget(add_btn)
         layout.addLayout(header)
 
-        # Join node
-        join_group = QGroupBox("Join Node")
-        join_layout = QHBoxLayout(join_group)
-        join_layout.addWidget(QLabel("ID:"))
-        self.node_id = QLineEdit()
-        self.node_id.setPlaceholderText("node-1")
-        join_layout.addWidget(self.node_id)
-        join_layout.addWidget(QLabel("URL:"))
-        self.node_url = QLineEdit()
-        self.node_url.setPlaceholderText("localhost:8001")
-        join_layout.addWidget(self.node_url)
-        join_layout.addWidget(QLabel("Role:"))
-        self.node_role = QComboBox()
-        self.node_role.addItems(["worker", "edge", "coordinator"])
-        join_layout.addWidget(self.node_role)
-        join_btn = QPushButton("Join")
-        join_btn.setProperty("class", "primary")
-        join_layout.addWidget(join_btn)
-        layout.addWidget(join_group)
+        # Cluster info
+        info_group = QGroupBox("Cluster Status")
+        info_form = QFormLayout(info_group)
+        self.lbl_nodes = QLabel("0 nodes")
+        self.lbl_shards = QLabel("0 shards")
+        self.lbl_status = QLabel("Standby")
+        info_form.addRow("Nodes:", self.lbl_nodes)
+        info_form.addRow("Shards:", self.lbl_shards)
+        info_form.addRow("Status:", self.lbl_status)
+        layout.addWidget(info_group)
 
-        # Nodes table
-        self.nodes_table = QTableWidget()
-        self.nodes_table.setColumnCount(6)
-        self.nodes_table.setHorizontalHeaderLabels([
-            "Node ID", "URL", "Role", "Weight", "Status", "Shards"
-        ])
-        self.nodes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.nodes_table.setAlternatingRowColors(True)
-        layout.addWidget(self.nodes_table, stretch=1)
+        # Node table
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Node", "Address", "Status", "Vectors", "CPU", "Memory"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setAlternatingRowColors(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table, stretch=1)
 
-        # Benchmark row
-        bench_row = QHBoxLayout()
-        bench_row.addWidget(QLabel("Benchmark:"))
-        self.bench_n = QLineEdit("1000")
-        self.bench_n.setMaximumWidth(80)
-        bench_row.addWidget(self.bench_n)
-        self.bench_k = QLineEdit("10")
-        self.bench_k.setMaximumWidth(60)
-        bench_row.addWidget(QLabel("k:"))
-        bench_row.addWidget(self.bench_k)
-        self.bench_strategy = QComboBox()
-        self.bench_strategy.addItems(["broadcast", "round_robin", "least_loaded"])
-        bench_row.addWidget(self.bench_strategy)
-        bench_btn = QPushButton("▶ Run Benchmark")
-        bench_btn.setProperty("class", "primary")
-        bench_row.addWidget(bench_btn)
-        bench_row.addStretch()
-        layout.addLayout(bench_row)
+        # Routing info
+        routing = QHBoxLayout()
+        routing.addWidget(QLabel("Sharding:"))
+        self.shard_input = QLineEdit()
+        self.shard_input.setPlaceholderText("Number of shards")
+        routing.addWidget(self.shard_input)
+        routing.addStretch()
+        layout.addLayout(routing)
 
-    def _on_refresh(self):
-        self.signals.status_message.emit("Refreshing cluster status...")
-
-    def _on_reset(self):
-        self.signals.status_message.emit("Resetting cluster...")
-
-    def get_params(self) -> list[dict]:
+    def get_params(self) -> list:
         return [
-            {"name": "strategy", "label": "Routing Strategy", "type": "combo",
-             "options": ["broadcast", "round_robin", "least_loaded"]},
-            {"name": "sharding", "label": "Sharding Strategy", "type": "combo",
-             "options": ["hash", "cluster", "geo"]},
+            {"name": "min_nodes", "label": "Min Nodes", "type": "spin", "min": 1, "max": 100, "default": 1},
+            {"name": "max_nodes", "label": "Max Nodes", "type": "spin", "min": 1, "max": 1000, "default": 50},
+            {"name": "n_chunks", "label": "MapReduce Chunks", "type": "spin", "min": 1, "max": 256, "default": 32},
         ]

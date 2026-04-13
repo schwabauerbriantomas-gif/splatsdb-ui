@@ -99,7 +99,8 @@ class ConfigEditor(QWidget):
         ftype = meta.get("type", "text")
         if ftype == "spin":
             w = QSpinBox()
-            w.setRange(meta.get("min", 0), meta.get("max", 99999))
+            max_val = min(meta.get("max", 99999), 2147483647)
+            w.setRange(meta.get("min", 0), max_val)
             w.setSingleStep(meta.get("step", 1))
             w.valueChanged.connect(lambda v, n=name: self._on_value_changed(n, v))
         elif ftype == "float":

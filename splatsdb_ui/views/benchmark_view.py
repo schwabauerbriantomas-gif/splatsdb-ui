@@ -1,21 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Benchmark view — GPU/CPU benchmarking with results."""
+"""Benchmark view — performance testing dashboard."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QGroupBox, QSpinBox, QComboBox, QLineEdit, QTextEdit,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QGroupBox, QFormLayout, QSpinBox, QComboBox,
 )
 from PySide6.QtCore import Qt
-
-from splatsdb_ui.utils.signals import SignalBus
-from splatsdb_ui.utils.state import AppState
+from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import BENCHMARK, PLAY
 
 
 class BenchmarkView(QWidget):
-    """Benchmark runner — GPU vs CPU, HNSW recall, ingestion benchmarks."""
-
-    def __init__(self, signals: SignalBus, state: AppState):
+    def __init__(self, signals, state):
         super().__init__()
         self.signals = signals
         self.state = state
@@ -23,129 +20,74 @@ class BenchmarkView(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
 
-        # Header
         header = QHBoxLayout()
         title = QLabel("Benchmarks")
-        title.setProperty("class", "title")
+        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 18px; font-weight: 700;")
         header.addWidget(title)
         header.addStretch()
 
-        gpu_btn = QPushButton("🖥️ GPU Info")
-        gpu_btn.clicked.connect(self._on_gpu_info)
-        header.addWidget(gpu_btn)
-
+        run_btn = QPushButton(f"{PLAY} Run Benchmark")
+        run_btn.setProperty("class", "primary")
+        header.addWidget(run_btn)
         layout.addLayout(header)
 
-        # Tabs for different benchmark types
+        # Tabs
         tabs = QTabWidget()
-        layout.addWidget(tabs, stretch=1)
 
-        # Tab 1: GPU Search Benchmark
-        gpu_tab = QWidget()
-        gpu_layout = QVBoxLayout(gpu_tab)
-        params = QGroupBox("GPU Search Benchmark Parameters")
-        params_layout = QHBoxLayout(params)
-        
-        params_layout.addWidget(QLabel("Vectors:"))
-        self.gpu_n = QSpinBox()
-        self.gpu_n.setRange(1000, 10000000)
-        self.gpu_n.setValue(10000)
-        self.gpu_n.setSingleStep(1000)
-        params_layout.addWidget(self.gpu_n)
-        
-        params_layout.addWidget(QLabel("Dim:"))
-        self.gpu_dim = QSpinBox()
-        self.gpu_dim.setRange(1, 8192)
-        self.gpu_dim.setValue(640)
-        params_layout.addWidget(self.gpu_dim)
-        
-        params_layout.addWidget(QLabel("Queries:"))
-        self.gpu_q = QSpinBox()
-        self.gpu_q.setRange(1, 100000)
-        self.gpu_q.setValue(100)
-        params_layout.addWidget(self.gpu_q)
-        
-        params_layout.addWidget(QLabel("Metric:"))
-        self.gpu_metric = QComboBox()
-        self.gpu_metric.addItems(["l2", "cosine"])
-        params_layout.addWidget(self.gpu_metric)
-        
-        run_btn = QPushButton("▶ Run")
-        run_btn.setProperty("class", "primary")
-        params_layout.addWidget(run_btn)
-        
-        gpu_layout.addWidget(params)
-        gpu_layout.addWidget(QTextEdit())
-        tabs.addTab(gpu_tab, "GPU Search")
+        # Search perf tab
+        search_tab = QWidget()
+        search_layout = QVBoxLayout(search_tab)
+        self.search_table = QTableWidget()
+        self.search_table.setColumnCount(5)
+        self.search_table.setHorizontalHeaderLabels(["Metric", "CPU", "GPU", "Speedup", "Notes"])
+        self.search_table.horizontalHeader().setStretchLastSection(True)
+        self.search_table.setRowCount(4)
+        for i, metric in enumerate(["QPS", "Latency p50", "Latency p99", "Recall@10"]):
+            self.search_table.setItem(i, 0, QTableWidgetItem(metric))
+        search_layout.addWidget(self.search_table)
+        tabs.addTab(search_tab, "Search")
 
-        # Tab 2: HNSW Recall Benchmark
+        # HNSW tab
         hnsw_tab = QWidget()
         hnsw_layout = QVBoxLayout(hnsw_tab)
-        hnsw_params = QGroupBox("HNSW Benchmark")
-        hnsw_pl = QHBoxLayout(hnsw_params)
-        
-        hnsw_pl.addWidget(QLabel("Train:"))
-        hnsw_pl.addWidget(QLineEdit("(binary file)"))
-        hnsw_pl.addWidget(QLabel("Queries:"))
-        hnsw_pl.addWidget(QLineEdit("(binary file)"))
-        hnsw_pl.addWidget(QLabel("Dim:"))
-        hnsw_pl.addWidget(QSpinBox())
-        
-        hnsw_run = QPushButton("▶ Run")
-        hnsw_run.setProperty("class", "primary")
-        hnsw_pl.addWidget(hnsw_run)
-        
-        hnsw_layout.addWidget(hnsw_params)
-        hnsw_layout.addWidget(QTextEdit())
-        tabs.addTab(hnsw_tab, "HNSW Recall")
+        self.hnsw_table = QTableWidget()
+        self.hnsw_table.setColumnCount(4)
+        self.hnsw_table.setHorizontalHeaderLabels(["M", "EF Construct", "Recall", "Build Time"])
+        self.hnsw_table.horizontalHeader().setStretchLastSection(True)
+        hnsw_layout.addWidget(self.hnsw_table)
+        tabs.addTab(hnsw_tab, "HNSW")
 
-        # Tab 3: GPU Ingest Pipeline
+        # Ingestion tab
         ingest_tab = QWidget()
         ingest_layout = QVBoxLayout(ingest_tab)
-        ingest_params = QGroupBox("GPU Ingest Pipeline")
-        ingest_pl = QHBoxLayout(ingest_params)
-        
-        ingest_pl.addWidget(QLabel("Vectors:"))
-        self.ingest_n = QSpinBox()
-        self.ingest_n.setRange(1000, 10000000)
-        self.ingest_n.setValue(100000)
-        ingest_pl.addWidget(self.ingest_n)
-        
-        ingest_pl.addWidget(QLabel("Dim:"))
-        self.ingest_dim = QSpinBox()
-        self.ingest_dim.setValue(640)
-        ingest_pl.addWidget(self.ingest_dim)
-        
-        ingest_pl.addWidget(QLabel("Clusters:"))
-        self.ingest_clusters = QSpinBox()
-        self.ingest_clusters.setValue(100)
-        ingest_pl.addWidget(self.ingest_clusters)
-        
-        ingest_run = QPushButton("▶ Run")
-        ingest_run.setProperty("class", "primary")
-        ingest_pl.addWidget(ingest_run)
-        
-        ingest_layout.addWidget(ingest_params)
-        ingest_layout.addWidget(QTextEdit())
-        tabs.addTab(ingest_tab, "GPU Ingest")
+        self.ingest_table = QTableWidget()
+        self.ingest_table.setColumnCount(4)
+        self.ingest_table.setHorizontalHeaderLabels(["Batch Size", "Vectors/sec", "Total Time", "Memory"])
+        self.ingest_table.horizontalHeader().setStretchLastSection(True)
+        ingest_layout.addWidget(self.ingest_table)
+        tabs.addTab(ingest_tab, "Ingestion")
 
-        # Tab 4: Results
-        results_tab = QWidget()
-        results_layout = QVBoxLayout(results_tab)
-        self.results_table = QTableWidget()
-        self.results_table.setColumnCount(6)
-        self.results_table.setHorizontalHeaderLabels([
-            "Benchmark", "Vectors", "Dim", "QPS", "Latency (ms)", "Recall"
-        ])
-        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        results_layout.addWidget(self.results_table)
-        tabs.addTab(results_tab, "Results History")
+        layout.addWidget(tabs, stretch=1)
 
-    def _on_gpu_info(self):
-        self.signals.status_message.emit("Querying GPU info...")
+        # Config
+        config_row = QHBoxLayout()
+        config_row.addWidget(QLabel("Dataset:"))
+        self.dataset_combo = QComboBox()
+        self.dataset_combo.addItems(["Random 100K", "Random 1M", "GloVe-100", "SIFT-128", "NYTimes-256"])
+        config_row.addWidget(self.dataset_combo)
+        config_row.addWidget(QLabel("K:"))
+        self.k_spin = QSpinBox()
+        self.k_spin.setRange(1, 1024)
+        self.k_spin.setValue(64)
+        config_row.addWidget(self.k_spin)
+        config_row.addStretch()
+        layout.addLayout(config_row)
 
-    def get_params(self) -> list[dict]:
-        return []
+    def get_params(self) -> list:
+        return [
+            {"name": "n_queries", "label": "Queries", "type": "spin", "min": 100, "max": 100000, "default": 1000},
+            {"name": "top_k", "label": "Top K", "type": "spin", "min": 1, "max": 1024, "default": 64},
+        ]

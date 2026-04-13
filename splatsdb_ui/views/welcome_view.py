@@ -1,106 +1,121 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Welcome view — landing screen with drop zone + recent + model selector."""
+"""Welcome view — landing page with quick actions."""
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QFrame, QGridLayout, QSizePolicy,
+    QComboBox, QFrame, QGridLayout, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QMimeData
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtCore import Signal, Qt
+from PySide6.QtGui import QFont, QDragEnterEvent, QDropEvent
 
-from splatsdb_ui.utils.signals import SignalBus
-from splatsdb_ui.utils.state import AppState
+from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import SEARCH, COLLECTION, GRAPH, SPATIAL, OCR, FILE, LINK
+
+
+class _ActionCard(QFrame):
+    """Clickable card for a quick action."""
+    clicked = Signal(str)
+
+    def __init__(self, action_id: str, title: str, description: str):
+        super().__init__()
+        self.action_id = action_id
+        self._title = title
+        self.setCursor(Qt.PointingHandCursor)
+        self._build_ui(title, description)
+
+    def _build_ui(self, title: str, desc: str):
+        self.setFixedSize(200, 100)
+        self.setStyleSheet(f"""
+            _ActionCard {{
+                background-color: {Colors.BG_RAISED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 10px;
+                padding: 14px;
+            }}
+            _ActionCard:hover {{
+                border-color: {Colors.ACCENT};
+                background-color: {Colors.BG_OVERLAY};
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(4)
+
+        t = QLabel(title)
+        t.setStyleSheet(f"color: {Colors.ACCENT}; font-weight: 700; font-size: 13px;")
+        layout.addWidget(t)
+
+        d = QLabel(desc)
+        d.setWordWrap(True)
+        d.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
+        layout.addWidget(d)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit(self.action_id)
+        super().mousePressEvent(event)
 
 
 class DropZone(QFrame):
-    """Drag-and-drop zone for importing files (vectors, documents, images for OCR)."""
-    files_dropped = Signal(list)  # list of file paths
+    """Drag-and-drop zone for files."""
+    files_dropped = Signal(list)
 
     def __init__(self):
         super().__init__()
         self.setAcceptDrops(True)
-        self.setObjectName("dropZone")
-        self.setMinimumHeight(200)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(180)
+        self._build_ui()
 
+    def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
 
-        icon = QLabel("📂")
-        icon.setFont(QFont("", 48))
-        icon.setAlignment(Qt.AlignCenter)
-        layout.addWidget(icon)
+        lbl = QLabel("Drop files here")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 16px; font-weight: 600;")
+        layout.addWidget(lbl)
 
-        title = QLabel("Drop files here")
-        title.setProperty("class", "title")
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        sub = QLabel("Vectors, documents, images, PDFs")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px;")
+        layout.addWidget(sub)
 
-        subtitle = QLabel(
-            "Vectors (.bin, .fvecs) • Documents (.txt, .pdf, .json) • Images (.png, .jpg) for OCR"
-        )
-        subtitle.setProperty("class", "subtitle")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
-
-        self.setStyleSheet("""
-            #dropZone {
-                border: 2px dashed #45475a;
+        self.setStyleSheet(f"""
+            DropZone {{
+                border: 2px dashed {Colors.BORDER};
                 border-radius: 12px;
-                background-color: #181825;
-                padding: 40px;
-            }
-            #dropZone:hover {
-                border-color: #f9a825;
-                background-color: #1e1e2e;
-            }
+                background-color: {Colors.BG};
+            }}
         """)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            self.setStyleSheet("""
-                #dropZone {
-                    border: 2px solid #f9a825;
+            self.setStyleSheet(f"""
+                DropZone {{
+                    border: 2px dashed {Colors.ACCENT};
                     border-radius: 12px;
-                    background-color: #262637;
-                    padding: 40px;
-                }
+                    background-color: rgba(245,158,11,0.05);
+                }}
             """)
 
     def dragLeaveEvent(self, event):
-        self.setStyleSheet("""
-            #dropZone {
-                border: 2px dashed #45475a;
+        self.setStyleSheet(f"""
+            DropZone {{
+                border: 2px dashed {Colors.BORDER};
                 border-radius: 12px;
-                background-color: #181825;
-                padding: 40px;
-            }
+                background-color: {Colors.BG};
+            }}
         """)
 
     def dropEvent(self, event: QDropEvent):
-        self.setStyleSheet("""
-            #dropZone {
-                border: 2px dashed #45475a;
-                border-radius: 12px;
-                background-color: #181825;
-                padding: 40px;
-            }
-        """)
-        files = []
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path:
-                files.append(path)
+        self.dragLeaveEvent(event)
+        files = [url.toLocalFile() for url in event.mimeData().urls()]
         if files:
             self.files_dropped.emit(files)
 
 
 class WelcomeView(QWidget):
-    """Welcome screen — first thing the user sees."""
-
-    def __init__(self, signals: SignalBus, state: AppState):
+    def __init__(self, signals, state):
         super().__init__()
         self.signals = signals
         self.state = state
@@ -108,87 +123,66 @@ class WelcomeView(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(60, 40, 60, 40)
+        layout.setContentsMargins(40, 30, 40, 20)
         layout.setSpacing(24)
 
         # Header
         header = QVBoxLayout()
+        header.setSpacing(4)
+
         title = QLabel("SplatsDB")
-        title.setProperty("class", "title")
-        title.setFont(QFont("", 32, QFont.Bold))
-        title.setStyleSheet("color: #f9a825; font-size: 32px; font-weight: 700;")
+        title.setStyleSheet(f"""
+            color: {Colors.TEXT};
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        """)
         header.addWidget(title)
 
-        subtitle = QLabel("Gaussian Splat Vector Search Engine")
-        subtitle.setProperty("class", "subtitle")
-        subtitle.setStyleSheet("color: #a6adc8; font-size: 16px;")
+        subtitle = QLabel("Vector search engine with semantic memory")
+        subtitle.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 14px;")
         header.addWidget(subtitle)
         layout.addLayout(header)
 
         # Drop zone
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._on_files_dropped)
-        layout.addWidget(self.drop_zone, stretch=1)
+        layout.addWidget(self.drop_zone)
 
-        # Quick actions
-        actions_layout = QHBoxLayout()
-        actions_layout.setSpacing(12)
+        # Quick actions grid
+        grid = QGridLayout()
+        grid.setSpacing(12)
 
         actions = [
-            ("🔍 Semantic Search", "Ctrl+K", lambda: self.signals.view_changed.emit("search")),
-            ("📚 Collections", "Ctrl+3", lambda: self.signals.view_changed.emit("collections")),
-            ("🔗 Knowledge Graph", "Ctrl+4", lambda: self.signals.view_changed.emit("graph")),
-            ("🗺️ Spatial Memory", "Ctrl+5", lambda: self.signals.view_changed.emit("spatial")),
-            ("📷 OCR + Embed", "Ctrl+8", lambda: self.signals.view_changed.emit("ocr")),
+            ("search",      f"{SEARCH} Search",        "Query your vector store"),
+            ("collections", f"{COLLECTION} Collections","Manage data collections"),
+            ("graph",       f"{GRAPH} Graph",          "Knowledge graph explorer"),
+            ("spatial",     f"{SPATIAL} Spatial",       "Memory spaces navigator"),
+            ("ocr",         f"{OCR} OCR Pipeline",     "Image/PDF to searchable text"),
+            ("config",      "Config",                   "Engine configuration"),
         ]
 
-        for label, shortcut, callback in actions:
-            btn = QPushButton(f"{label}\n{shortcut}")
-            btn.setMinimumHeight(60)
-            btn.clicked.connect(callback)
-            actions_layout.addWidget(btn)
+        for i, (aid, title, desc) in enumerate(actions):
+            card = _ActionCard(aid, title, desc)
+            card.clicked.connect(self._on_action)
+            grid.addWidget(card, i // 3, i % 3)
 
-        layout.addLayout(actions_layout)
+        layout.addLayout(grid)
+        layout.addStretch()
 
-        # Model selector row
-        model_layout = QHBoxLayout()
-        model_label = QLabel("Active embedding model:")
-        model_label.setStyleSheet("color: #a6adc8;")
-        model_layout.addWidget(model_label)
+        # Model selector at bottom
+        bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("Embedding model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(280)
+        bottom.addWidget(self.model_combo, stretch=1)
+        layout.addLayout(bottom)
 
-        self.model_btn = QPushButton("Select Model →")
-        self.model_btn.clicked.connect(lambda: self.signals.view_changed.emit("settings"))
-        model_layout.addWidget(self.model_btn)
-        model_layout.addStretch()
+    def _on_action(self, action_id: str):
+        self.signals.view_changed.emit(action_id)
 
-        # Backend status
-        self.status_label = QLabel("● Disconnected")
-        self.status_label.setStyleSheet("color: #f38ba8;")
-        model_layout.addWidget(self.status_label)
+    def _on_files_dropped(self, files: list):
+        self.signals.status_message.emit(f"Received {len(files)} files")
 
-        layout.addLayout(model_layout)
-
-    def _on_files_dropped(self, files: list[str]):
-        """Handle dropped files — route by type."""
-        for path in files:
-            ext = path.rsplit(".", 1)[-1].lower()
-            if ext in ("png", "jpg", "jpeg", "tiff", "bmp", "pdf"):
-                # Route to OCR view
-                self.signals.view_changed.emit("ocr")
-                self.signals.status_message.emit(f"OCR: {path}")
-            elif ext in ("bin", "fvecs", "bvecs", "ivecs"):
-                # Route to collections (vector import)
-                self.signals.view_changed.emit("collections")
-                self.signals.status_message.emit(f"Import vectors: {path}")
-            elif ext in ("txt", "json", "md", "csv"):
-                # Route to search (document store)
-                self.signals.view_changed.emit("search")
-                self.signals.status_message.emit(f"Document: {path}")
-
-    def update_connection_status(self, connected: bool, version: str = ""):
-        if connected:
-            self.status_label.setText(f"● Connected v{version}")
-            self.status_label.setStyleSheet("color: #a6e3a1;")
-        else:
-            self.status_label.setText("● Disconnected")
-            self.status_label.setStyleSheet("color: #f38ba8;")
+    def update_connection_status(self, connected: bool):
+        pass

@@ -1,85 +1,65 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Status bar widget — GPU VRAM, connection, model info."""
+"""Status bar — connection, model, stats."""
 
-from PySide6.QtWidgets import QStatusBar, QLabel, QProgressBar, QHBoxLayout, QWidget
+from PySide6.QtWidgets import QStatusBar, QLabel, QWidget, QHBoxLayout
 from PySide6.QtCore import Qt
+from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import DOT_ON, DOT_OFF, PIPE
 
 
 class SplatsDBStatusBar(QStatusBar):
-    """Custom status bar with GPU monitor, model name, and connection indicator."""
-
     def __init__(self):
         super().__init__()
         self._build_ui()
 
     def _build_ui(self):
-        # Connection indicator
-        self.conn_label = QLabel("● Disconnected")
-        self.conn_label.setStyleSheet("color: #f38ba8; padding: 0 12px;")
+        # Connection
+        self.conn_label = QLabel(f"{DOT_OFF} Disconnected")
+        self.conn_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
         self.addWidget(self.conn_label)
 
-        # Separator
-        self.addWidget(self._separator())
+        self._add_sep()
 
-        # Active model
-        self.model_label = QLabel("Model: none")
-        self.model_label.setStyleSheet("color: #a6adc8; padding: 0 12px;")
+        # Model / Preset
+        self.model_label = QLabel("No engine")
+        self.model_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
         self.addWidget(self.model_label)
 
-        # Separator
-        self.addWidget(self._separator())
+        self._add_sep()
 
-        # GPU VRAM
-        self.vram_label = QLabel("GPU: —")
-        self.vram_label.setStyleSheet("color: #a6adc8; padding: 0 12px;")
-        self.addWidget(self.vram_label)
+        # Document count
+        self.doc_label = QLabel("0 vectors")
+        self.doc_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
+        self.addWidget(self.doc_label)
 
-        self.vram_bar = QProgressBar()
-        self.vram_bar.setFixedWidth(120)
-        self.vram_bar.setFixedHeight(8)
-        self.vram_bar.setTextVisible(False)
-        self.vram_bar.setStyleSheet("""
-            QProgressBar { background-color: #313244; border: none; border-radius: 4px; }
-            QProgressBar::chunk { background-color: #a6e3a1; border-radius: 4px; }
-        """)
-        self.addPermanentWidget(self.vram_bar)
+        self._add_sep()
 
-        # Permanent message area
-        self.message_label = QLabel("")
-        self.message_label.setStyleSheet("color: #585b70; padding: 0 12px;")
-        self.addPermanentWidget(self.message_label)
+        # GPU
+        self.gpu_label = QLabel("CPU")
+        self.gpu_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
+        self.addPermanentWidget(self.gpu_label)
 
-    def _separator(self) -> QLabel:
-        sep = QLabel("│")
-        sep.setStyleSheet("color: #313244;")
-        return sep
+    def _add_sep(self):
+        sep = QLabel(PIPE)
+        sep.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 10px; margin: 0 6px;")
+        self.addWidget(sep)
 
-    def show_message(self, text: str):
-        self.message_label.setText(text)
-
-    def set_connected(self, connected: bool, version: str = ""):
+    def set_connected(self, connected: bool, preset: str = ""):
         if connected:
-            self.conn_label.setText(f"● Connected v{version}")
-            self.conn_label.setStyleSheet("color: #a6e3a1; padding: 0 12px;")
+            self.conn_label.setText(f"{DOT_ON} Connected")
+            self.conn_label.setStyleSheet(f"color: {Colors.SUCCESS}; font-size: 11px;")
         else:
-            self.conn_label.setText("● Disconnected")
-            self.conn_label.setStyleSheet("color: #f38ba8; padding: 0 12px;")
+            self.conn_label.setText(f"{DOT_OFF} Disconnected")
+            self.conn_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
 
     def set_model(self, name: str):
-        self.model_label.setText(f"Model: {name}")
+        self.model_label.setText(name or "No engine")
 
-    def set_vram(self, used_gb: float, total_gb: float):
-        self.vram_label.setText(f"GPU: {used_gb:.1f}/{total_gb:.1f} GB")
-        pct = int((used_gb / total_gb) * 100) if total_gb > 0 else 0
-        self.vram_bar.setValue(pct)
-        # Color based on usage
-        if pct > 90:
-            color = "#f38ba8"
-        elif pct > 70:
-            color = "#f9e2af"
-        else:
-            color = "#a6e3a1"
-        self.vram_bar.setStyleSheet(f"""
-            QProgressBar {{ background-color: #313244; border: none; border-radius: 4px; }}
-            QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}
-        """)
+    def set_doc_count(self, count: int):
+        self.doc_label.setText(f"{count:,} vectors")
+
+    def set_gpu(self, info: str):
+        self.gpu_label.setText(info)
+
+    def show_message(self, msg: str, timeout: int = 4000):
+        self.showMessage(msg, timeout)

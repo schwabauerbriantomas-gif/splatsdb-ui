@@ -1,97 +1,92 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Result card widget — displays a single search result."""
+"""Result card — search result display."""
 
-from PySide6.QtWidgets import (
-    QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy,
-)
+from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressBar
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QFont
-
-from splatsdb_ui.utils.api_client import SearchResult
+from splatsdb_ui.utils.theme import Colors
+from splatsdb_ui.utils.icons import LINK, ARROW_R, TEXT, CHECK
 
 
 class ResultCard(QFrame):
-    """A card displaying one search result with score, text preview, and actions."""
+    store_clicked = Signal(int)
+    explore_clicked = Signal(int)
 
-    copy_requested = Signal(str)    # text
-    store_requested = Signal(str)   # text
-    explore_requested = Signal(int) # index
-
-    def __init__(self, result: SearchResult, rank: int = 1):
+    def __init__(self, index: int, score: float, metadata: str = ""):
         super().__init__()
-        self.result = result
-        self._build_ui(rank)
+        self.index = index
+        self.score = score
+        self.metadata = metadata
+        self._build_ui()
 
-        self.setStyleSheet("""
-            ResultCard {
-                background-color: #181825;
-                border: 1px solid #313244;
+    def _build_ui(self):
+        self.setStyleSheet(f"""
+            ResultCard {{
+                background-color: {Colors.BG_RAISED};
+                border: 1px solid {Colors.BORDER};
                 border-radius: 8px;
-                padding: 12px;
-            }
-            ResultCard:hover {
-                border-color: #f9a825;
-                background-color: #1e1e2e;
-            }
+                padding: 10px 14px;
+            }}
+            ResultCard:hover {{
+                border-color: {Colors.ACCENT};
+            }}
         """)
 
-    def _build_ui(self, rank: int):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(6)
+        layout.setContentsMargins(12, 10, 12, 10)
 
-        # Top row: rank + score + actions
-        top = QHBoxLayout()
+        # Header row
+        header = QHBoxLayout()
+        idx_label = QLabel(f"#{self.index}")
+        idx_label.setStyleSheet(f"color: {Colors.ACCENT}; font-weight: 700; font-size: 12px;")
+        header.addWidget(idx_label)
 
-        rank_label = QLabel(f"#{rank}")
-        rank_label.setFont(QFont("", 12, QFont.Bold))
-        rank_label.setStyleSheet("color: #f9a825;")
-        rank_label.setFixedWidth(40)
-        top.addWidget(rank_label)
+        score_pct = f"{self.score:.1%}"
+        score_label = QLabel(score_pct)
+        score_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px; font-weight: 600;")
+        header.addWidget(score_label)
+        header.addStretch()
 
-        # Score badge
-        score = self.result.score
-        if score > 0.8:
-            score_color = "#a6e3a1"
-        elif score > 0.5:
-            score_color = "#f9e2af"
-        else:
-            score_color = "#f38ba8"
+        # Action buttons (small)
+        store_btn = QPushButton(TEXT)
+        store_btn.setFixedSize(24, 24)
+        store_btn.setToolTip("Store")
+        store_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none;
+                color: {Colors.TEXT_DIM}; font-size: 12px;
+            }}
+            QPushButton:hover {{ color: {Colors.ACCENT}; }}
+        """)
+        store_btn.clicked.connect(lambda: self.store_clicked.emit(self.index))
+        header.addWidget(store_btn)
 
-        score_label = QLabel(f"{score:.4f}")
-        score_label.setFont(QFont("", 11, QFont.Bold))
-        score_label.setStyleSheet(f"color: {score_color};")
-        score_label.setFixedWidth(70)
-        top.addWidget(score_label)
+        link_btn = QPushButton(LINK)
+        link_btn.setFixedSize(24, 24)
+        link_btn.setToolTip("Explore")
+        link_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none;
+                color: {Colors.TEXT_DIM}; font-size: 12px;
+            }}
+            QPushButton:hover {{ color: {Colors.ACCENT}; }}
+        """)
+        link_btn.clicked.connect(lambda: self.explore_clicked.emit(self.index))
+        header.addWidget(link_btn)
 
-        top.addStretch()
+        layout.addLayout(header)
 
-        # Action buttons
-        copy_btn = QPushButton("📋")
-        copy_btn.setFixedSize(28, 28)
-        copy_btn.setToolTip("Copy text")
-        top.addWidget(copy_btn)
+        # Score bar
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(int(self.score * 100))
+        bar.setFixedHeight(4)
+        bar.setTextVisible(False)
+        layout.addWidget(bar)
 
-        explore_btn = QPushButton("🔗")
-        explore_btn.setFixedSize(28, 28)
-        explore_btn.setToolTip("Find similar")
-        top.addWidget(explore_btn)
-
-        layout.addLayout(top)
-
-        # Text preview
-        text = self.result.text or self.result.metadata or f"Vector #{self.result.index}"
-        if len(text) > 300:
-            text = text[:300] + "..."
-        text_label = QLabel(text)
-        text_label.setWordWrap(True)
-        text_label.setStyleSheet("color: #cdd6f4;")
-        layout.addWidget(text_label)
-
-        # Metadata
-        if self.result.metadata:
-            meta_label = QLabel(self.result.metadata[:150])
-            meta_label.setWordWrap(True)
-            meta_label.setStyleSheet("color: #585b70; font-size: 11px;")
-            layout.addWidget(meta_label)
+        # Metadata preview
+        if self.metadata:
+            preview = QLabel(str(self.metadata)[:200])
+            preview.setWordWrap(True)
+            preview.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 12px;")
+            layout.addWidget(preview)
