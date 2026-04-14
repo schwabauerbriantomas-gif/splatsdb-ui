@@ -45,6 +45,7 @@ from splatsdb_ui.views.cluster_view import ClusterView
 from splatsdb_ui.views.benchmark_view import BenchmarkView
 from splatsdb_ui.views.ocr_view import OCRView
 from splatsdb_ui.views.splat3d_view import Splat3DView
+from splatsdb_ui.views.ebm_view import EBMView
 
 from splatsdb_ui.mixins.file_mixin import FileMixin
 from splatsdb_ui.mixins.search_mixin import SearchMixin
@@ -129,6 +130,7 @@ class MainWindow(
             ("graph",       GraphView),
             ("spatial",     SpatialView),
             ("cluster",     ClusterView),
+            ("ebm",         EBMView),
             ("benchmark",   BenchmarkView),
             ("ocr",         OCRView),
         ]
@@ -315,7 +317,7 @@ class MainWindow(
         # Load into all views
         self.splat3d.load_nodes(demo_nodes)
 
-        for view_id in ("cluster", "spatial", "graph"):
+        for view_id in ("cluster", "spatial", "graph", "ebm"):
             v = self._views.get(view_id)
             if v and hasattr(v, "load_nodes"):
                 v.load_nodes(demo_nodes)

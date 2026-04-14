@@ -93,6 +93,7 @@ def tab_label(view_id: str) -> str:
         "spatial":     "Spatial",
         "cluster":     "Cluster",
         "benchmark":   "Benchmark",
+        "ebm":         "EBM",
         "ocr":         "OCR",
         "config":      "Config",
     }
@@ -107,6 +108,7 @@ TAB_ICONS = {
     "spatial":     "spatial",
     "cluster":     "cluster",
     "benchmark":   "benchmark",
+    "ebm":         "ebm",
     "ocr":         "ocr",
     "config":      "config",
 }
