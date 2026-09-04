@@ -32,13 +32,22 @@ SplatDB UI is a professional desktop application for managing and visualizing ve
 ## Quick Start
 
 ```bash
-# Install
-pip install splatsdb-ui
+# Install (from source — not published to PyPI)
+pip install git+https://github.com/schwabauerbriantomas-gif/splatdb-ui.git
 
 # With all extras (OCR + embeddings)
-pip install "splatsdb-ui[all]"
+pip install "splatsdb-ui[all] @ git+https://github.com/schwabauerbriantomas-gif/splatdb-ui.git"
 
 # Launch
+splatsdb-ui
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/schwabauerbriantomas-gif/splatdb-ui.git
+cd splatdb-ui
+pip install ".[all]"
 splatsdb-ui
 ```
 
